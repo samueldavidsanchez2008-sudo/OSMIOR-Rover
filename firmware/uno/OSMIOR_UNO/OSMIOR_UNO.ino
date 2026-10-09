@@ -1,468 +1,349 @@
 #include <SoftwareSerial.h>
 #include <DFRobotDFPlayerMini.h>
+#include <ctype.h>
+#include <string.h>
 
-// ============================================================
-// OSMIOR - ARDUINO UNO
-// ------------------------------------------------------------
-// Motores: se conserva la logica original y los pines D3-D9.
-// UART NICLA: D10 RX / D11 TX @ 9600.
-// DFPlayer: D12 TX -> RX del DFPlayer. D13 queda sin conectar.
-// HC-SR04 izquierda: TRIG A0 / ECHO A1.
-// HC-SR04 derecha : TRIG A2 / ECHO A3.
+// OSMIOR V3 - UNO
+// Motores intactos en D3-D9. UART NICLA D10 RX / D11 TX.
+// DFPlayer TX-only: D12 -> RX del DFPlayer; no conectar su TX.
+// HC-SR04 izq A0/A1, der A2/A3.
 //
-// NOTA IMPORTANTE DE ESTRUCTURA:
-// Arduino SoftwareSerial solo permite UNA instancia escuchando RX
-// a la vez. El DFPlayer se usa solo para TX, por lo que despues
-// de inicializarlo se fuerza niclaSerial.listen().
-// ============================================================
+// Protocolo NICLA -> UNO (minimo):
+//   F/B/L/R/S = movimiento inmediato, un byte
+//   A1..A5    = audio, dos bytes
+//   ?         = solicitud de telemetria
+// UNO -> NICLA:
+//   K,M,F\n / K,A,5\n = ACK
+//   T,DL,DR,DF,STATE,RX_BAD,OVF\n = telemetria compacta
 
-// ---------------- UART NICLA ----------------
-SoftwareSerial niclaSerial(10, 11);  // RX, TX
-
-// ---------------- DFPlayer ----------------
-// RX dummy en D13: NO conectar el TX del DFPlayer.
-// TX real del UNO en D12 -> RX del DFPlayer.
-SoftwareSerial dfPlayerSerial(13, 12); // RX dummy, TX
+SoftwareSerial niclaSerial(10, 11);     // RX, TX
+SoftwareSerial dfPlayerSerial(13, 12);  // RX dummy, TX real en D12
 DFRobotDFPlayerMini dfPlayer;
 bool dfPlayerOK = false;
 
-// ---------------- TB6612 izquierdo ----------------
-const uint8_t PWM_L  = 3;
-const uint8_t IN1_L  = 4;
-const uint8_t IN2_L  = 5;
-
-// ---------------- TB6612 derecho ----------------
-const uint8_t PWM_R  = 6;
-const uint8_t IN1_R  = 7;
-const uint8_t IN2_R  = 8;
-
-// ---------------- Standby ----------------
+// TB6612 - NO CAMBIAR
+const uint8_t PWM_L = 3;
+const uint8_t IN1_L = 4;
+const uint8_t IN2_L = 5;
+const uint8_t PWM_R = 6;
+const uint8_t IN1_R = 7;
+const uint8_t IN2_R = 8;
 const uint8_t STBY = 9;
-
-// ---------------- Velocidad fija original ----------------
 const uint8_t VELOCIDAD = 220;
 
-// ---------------- HC-SR04 ----------------
+// HC-SR04
 const uint8_t TRIG_L = A0;
 const uint8_t ECHO_L = A1;
 const uint8_t TRIG_R = A2;
 const uint8_t ECHO_R = A3;
-
-const unsigned long ECHO_TIMEOUT_US = 25000UL;
+const unsigned long ECHO_TIMEOUT_US = 15000UL;
 const unsigned long SENSOR_PERIOD_MS = 100UL;
-const unsigned long TELEMETRY_PERIOD_MS = 200UL;
 
-// ---------------- Buffers fijos ----------------
-// Evitamos String para no fragmentar el heap del ATmega328P.
-char niclaBuffer[48];
-uint8_t niclaIndex = 0;
-
-char usbBuffer[16];
+// Buffers fijos: evita String y fragmentacion del heap del UNO.
+char legacyBuffer[24];
+uint8_t legacyIndex = 0;
+char usbBuffer[8];
 uint8_t usbIndex = 0;
 
-// ---------------- Estado ----------------
+// Estado
 char currentMotion = 'S';
 float distL = -1.0f;
 float distR = -1.0f;
-
+bool audioPrefixSeen = false;
 unsigned long lastSensorMs = 0;
-unsigned long lastTelemetryMs = 0;
+unsigned long rxGoodCommands = 0;
+unsigned long rxBadBytes = 0;
+unsigned long rxLineOverflows = 0;
+unsigned long softwareRxOverflows = 0;
 
-// ============================================================
-// PROTOTIPOS
-// ============================================================
-
-void processNiclaLine(char *line);
 void processCommand(char cmd, const char *origin);
+void processNiclaByte(uint8_t raw);
+void processLegacyLine(char *line);
+void readNiclaSerial();
+void readUsbSerial();
 void sendNicla(const char *line);
 void sendAckCommand(char cmd);
 void sendAckAudio(uint8_t track);
-
+void sendTelemetry();
+void reproducirAudio(uint8_t track);
+float medirSensor(uint8_t trigPin, uint8_t echoPin);
+void updateSensors();
 void adelante();
 void atras();
 void izquierda();
 void derecha();
 void detener();
 
-float medirSensor(uint8_t trigPin, uint8_t echoPin);
-void updateSensors();
-void sendTelemetry();
-void reproducirAudio(uint8_t track);
-
-void readNiclaSerial();
-void readUsbSerial();
-
-// ============================================================
-// SETUP
-// ============================================================
-
 void setup() {
   Serial.begin(115200);
-
-  // IMPORTANTE: cada begin() de SoftwareSerial puede cambiar
-  // cual instancia queda escuchando. Por eso al final de setup()
-  // hacemos niclaSerial.listen().
   niclaSerial.begin(9600);
   dfPlayerSerial.begin(9600);
 
-  // Motores
-  pinMode(PWM_L, OUTPUT);
-  pinMode(IN1_L, OUTPUT);
-  pinMode(IN2_L, OUTPUT);
-
-  pinMode(PWM_R, OUTPUT);
-  pinMode(IN1_R, OUTPUT);
-  pinMode(IN2_R, OUTPUT);
-
+  pinMode(PWM_L, OUTPUT); pinMode(IN1_L, OUTPUT); pinMode(IN2_L, OUTPUT);
+  pinMode(PWM_R, OUTPUT); pinMode(IN1_R, OUTPUT); pinMode(IN2_R, OUTPUT);
   pinMode(STBY, OUTPUT);
   digitalWrite(STBY, HIGH);
   detener();
 
-  // HC-SR04
-  pinMode(TRIG_L, OUTPUT);
-  pinMode(ECHO_L, INPUT);
-  pinMode(TRIG_R, OUTPUT);
-  pinMode(ECHO_R, INPUT);
+  pinMode(TRIG_L, OUTPUT); pinMode(ECHO_L, INPUT);
+  pinMode(TRIG_R, OUTPUT); pinMode(ECHO_R, INPUT);
   digitalWrite(TRIG_L, LOW);
   digitalWrite(TRIG_R, LOW);
 
-  Serial.println(F("=========================================="));
-  Serial.println(F("OSMIOR UNO - INIT"));
-  Serial.println(F("Motors: D3-D9"));
-  Serial.println(F("NICLA UART: D10/D11"));
-  Serial.println(F("DFPlayer TX: D12 -> RX"));
-  Serial.println(F("HC-SR04: A0/A1 + A2/A3"));
-  Serial.println(F("=========================================="));
+  Serial.println(F("OSMIOR UNO V3 - comms optimized"));
+  Serial.println(F("Motors D3-D9 unchanged | NICLA D10/D11"));
+  Serial.println(F("DFPlayer D12 TX-only | HC-SR04 A0/A1 A2/A3"));
 
-  delay(500);
-
-  // El TX del DFPlayer no esta conectado, asi que no pedimos ACK.
+  delay(350);
   if (dfPlayer.begin(dfPlayerSerial, false, true)) {
     dfPlayerOK = true;
     dfPlayer.volume(25);
-    delay(250);
-    reproducirAudio(1); // AUDIO 001: inicio
+    delay(200);
+    dfPlayer.play(1); // track 001: startup
+    Serial.println(F("[DF] init OK; track 1 requested"));
   } else {
     dfPlayerOK = false;
-    Serial.println(F("[DF] init warning"));
+    Serial.println(F("[DF] init failed"));
   }
 
-  // CRITICO: dejar al NICLA como unica instancia RX activa.
+  // Restore NICLA as the only active SoftwareSerial receiver.
   niclaSerial.listen();
-
   detener();
   sendNicla(dfPlayerOK ? "READY,UNO,1,DF,1" : "READY,UNO,1,DF,0");
 }
-
-// ============================================================
-// LOOP
-// ============================================================
 
 void loop() {
   readNiclaSerial();
   readUsbSerial();
 
   const unsigned long now = millis();
-
   if (now - lastSensorMs >= SENSOR_PERIOD_MS) {
     lastSensorMs = now;
     updateSensors();
   }
+}
 
-  if (now - lastTelemetryMs >= TELEMETRY_PERIOD_MS) {
-    lastTelemetryMs = now;
-    sendTelemetry();
+// -------------------- NICLA RX: byte parser --------------------
+void readNiclaSerial() {
+  // Do not call listen() continuously: only restore it after DFPlayer TX.
+  while (niclaSerial.available() > 0) {
+    processNiclaByte((uint8_t)niclaSerial.read());
+  }
+
+  if (niclaSerial.overflow()) {
+    softwareRxOverflows++;
+    Serial.println(F("[UART] SoftwareSerial RX overflow"));
   }
 }
 
-// ============================================================
-// SERIAL RX
-// ============================================================
-
-void readNiclaSerial() {
-  // Por si alguna operacion del DFPlayer lo cambio, recuperamos
-  // explicitamente el receptor del NICLA antes de leer.
-  niclaSerial.listen();
-
-  while (niclaSerial.available() > 0) {
-    const char c = (char)niclaSerial.read();
-
-    if (c == '\r') continue;
-
-    if (c == '\n') {
-      niclaBuffer[niclaIndex] = '\0';
-
-      if (niclaIndex > 0) {
-        processNiclaLine(niclaBuffer);
-      }
-
-      niclaIndex = 0;
-      continue;
+void processNiclaByte(uint8_t raw) {
+  if (raw == '\r' || raw == '\n') {
+    if (legacyIndex > 0) {
+      legacyBuffer[legacyIndex] = '\0';
+      processLegacyLine(legacyBuffer);
+      legacyIndex = 0;
     }
+    audioPrefixSeen = false;
+    return;
+  }
 
-    if (niclaIndex < sizeof(niclaBuffer) - 1) {
-      niclaBuffer[niclaIndex++] = c;
-    } else {
-      // Descartar linea corrupta/overflow.
-      niclaIndex = 0;
+  // Discard control/non-ASCII bytes. They must never enter string parsing.
+  if (raw < 0x20 || raw > 0x7E) {
+    rxBadBytes++;
+    return;
+  }
+
+  const char c = (char)toupper(raw);
+
+  // Motion commands are executed immediately: no need to wait for LF.
+  if (c == 'F' || c == 'B' || c == 'L' || c == 'R' || c == 'S') {
+    legacyIndex = 0;
+    audioPrefixSeen = false;
+    processCommand(c, "NICLA");
+    return;
+  }
+
+  // Audio consists of exactly A followed by digit 1..5.
+  if (audioPrefixSeen) {
+    audioPrefixSeen = false;
+    if (c >= '1' && c <= '5') {
+      legacyIndex = 0;
+      reproducirAudio((uint8_t)(c - '0'));
+      return;
     }
   }
+
+  if (c == 'A') {
+    audioPrefixSeen = true;
+    legacyIndex = 0;
+    return;
+  }
+
+  // '?' is a scheduled telemetry poll from the NICLA. No unsolicited
+  // telemetry is sent, keeping the UART half-duplex traffic coordinated.
+  if (c == '?') {
+    legacyIndex = 0;
+    sendTelemetry();
+    return;
+  }
+
+  // Optional old textual diagnostics. A motion letter within a legacy
+  // CMD,F line is already executed above when the F byte arrives.
+  if (legacyIndex < sizeof(legacyBuffer) - 1) {
+    legacyBuffer[legacyIndex++] = c;
+  } else {
+    legacyIndex = 0;
+    rxLineOverflows++;
+  }
+}
+
+void processLegacyLine(char *line) {
+  if (strcmp(line, "PING") == 0) {
+    sendNicla("PONG");
+    return;
+  }
+  if (strcmp(line, "STOP") == 0) {
+    processCommand('S', "NICLA");
+    return;
+  }
+  // Do not flood the monitor with random noise; count malformed frames.
+  rxLineOverflows++;
 }
 
 void readUsbSerial() {
   while (Serial.available() > 0) {
     const char c = (char)Serial.read();
-
     if (c == '\r' || c == '\n') {
-      if (usbIndex == 1) {
-        processCommand((char)usbBuffer[0], "USB");
-      }
+      if (usbIndex == 1) processCommand((char)toupper(usbBuffer[0]), "USB");
       usbIndex = 0;
       continue;
     }
-
-    if (usbIndex < sizeof(usbBuffer) - 1) {
-      usbBuffer[usbIndex++] = c;
-    } else {
-      usbIndex = 0;
-    }
+    if (usbIndex < sizeof(usbBuffer) - 1) usbBuffer[usbIndex++] = c;
+    else usbIndex = 0;
   }
-}
-
-// ============================================================
-// PROTOCOLO NICLA -> UNO
-// Acepta el protocolo nuevo y comandos legacy simples.
-// ============================================================
-
-void processNiclaLine(char *line) {
-  if (strncmp(line, "CMD,", 4) == 0 && line[5] == '\0') {
-    processCommand(line[4], "NICLA");
-    return;
-  }
-
-  // Compatibilidad: F/B/L/R/S
-  if (line[0] != '\0' && line[1] == '\0') {
-    processCommand(line[0], "NICLA");
-    return;
-  }
-
-  if (strncmp(line, "AUD,", 4) == 0) {
-    const int track = atoi(line + 4);
-    if (track >= 1 && track <= 5) {
-      reproducirAudio((uint8_t)track);
-    }
-    return;
-  }
-
-  // Compatibilidad: AUD:3
-  if (strncmp(line, "AUD:", 4) == 0) {
-    const int track = atoi(line + 4);
-    if (track >= 1 && track <= 5) {
-      reproducirAudio((uint8_t)track);
-    }
-    return;
-  }
-
-  if (strcmp(line, "PING") == 0) {
-    sendNicla("PONG");
-    return;
-  }
-
-  if (strcmp(line, "STOP") == 0) {
-    processCommand('S', "NICLA");
-    return;
-  }
-
-  Serial.print(F("[UNO] Unknown line: "));
-  Serial.println(line);
-  sendNicla("ERR,UNKNOWN");
 }
 
 void processCommand(char cmd, const char *origin) {
   cmd = (char)toupper((unsigned char)cmd);
-
   switch (cmd) {
-    case 'F':
-      adelante();
-      currentMotion = 'F';
-      break;
-
-    case 'B':
-      atras();
-      currentMotion = 'B';
-      break;
-
-    case 'L':
-      izquierda();
-      currentMotion = 'L';
-      break;
-
-    case 'R':
-      derecha();
-      currentMotion = 'R';
-      break;
-
-    case 'S':
-      detener();
-      currentMotion = 'S';
-      break;
-
-    default:
-      Serial.print(F("[UNO] Bad command: "));
-      Serial.println(cmd);
-      sendNicla("ERR,BAD_CMD");
-      return;
+    case 'F': adelante(); currentMotion = 'F'; break;
+    case 'B': atras(); currentMotion = 'B'; break;
+    case 'L': izquierda(); currentMotion = 'L'; break;
+    case 'R': derecha(); currentMotion = 'R'; break;
+    case 'S': detener(); currentMotion = 'S'; break;
+    default: return;
   }
 
-  Serial.print(F("[UNO] "));
-  Serial.print(origin);
-  Serial.print(F(" -> "));
+  rxGoodCommands++;
+  Serial.print(F("[UNO] NICLA -> "));
   Serial.println(cmd);
-
   sendAckCommand(cmd);
 }
 
-// ============================================================
-// MOTORES - NO CAMBIAR LOGICA
-// ============================================================
-
+// -------------------- MOTORES: LOGICA ORIGINAL INTACTA --------------------
 void adelante() {
-  digitalWrite(IN1_L, HIGH);
-  digitalWrite(IN2_L, LOW);
-  analogWrite(PWM_L, VELOCIDAD);
-
-  digitalWrite(IN1_R, HIGH);
-  digitalWrite(IN2_R, LOW);
-  analogWrite(PWM_R, VELOCIDAD);
+  digitalWrite(IN1_L, HIGH); digitalWrite(IN2_L, LOW); analogWrite(PWM_L, VELOCIDAD);
+  digitalWrite(IN1_R, HIGH); digitalWrite(IN2_R, LOW); analogWrite(PWM_R, VELOCIDAD);
 }
 
 void atras() {
-  digitalWrite(IN1_L, LOW);
-  digitalWrite(IN2_L, HIGH);
-  analogWrite(PWM_L, VELOCIDAD);
-
-  digitalWrite(IN1_R, LOW);
-  digitalWrite(IN2_R, HIGH);
-  analogWrite(PWM_R, VELOCIDAD);
+  digitalWrite(IN1_L, LOW); digitalWrite(IN2_L, HIGH); analogWrite(PWM_L, VELOCIDAD);
+  digitalWrite(IN1_R, LOW); digitalWrite(IN2_R, HIGH); analogWrite(PWM_R, VELOCIDAD);
 }
 
 void izquierda() {
-  digitalWrite(IN1_L, LOW);
-  digitalWrite(IN2_L, HIGH);
-  analogWrite(PWM_L, VELOCIDAD);
-
-  digitalWrite(IN1_R, HIGH);
-  digitalWrite(IN2_R, LOW);
-  analogWrite(PWM_R, VELOCIDAD);
+  digitalWrite(IN1_L, LOW); digitalWrite(IN2_L, HIGH); analogWrite(PWM_L, VELOCIDAD);
+  digitalWrite(IN1_R, HIGH); digitalWrite(IN2_R, LOW); analogWrite(PWM_R, VELOCIDAD);
 }
 
 void derecha() {
-  digitalWrite(IN1_L, HIGH);
-  digitalWrite(IN2_L, LOW);
-  analogWrite(PWM_L, VELOCIDAD);
-
-  digitalWrite(IN1_R, LOW);
-  digitalWrite(IN2_R, HIGH);
-  analogWrite(PWM_R, VELOCIDAD);
+  digitalWrite(IN1_L, HIGH); digitalWrite(IN2_L, LOW); analogWrite(PWM_L, VELOCIDAD);
+  digitalWrite(IN1_R, LOW); digitalWrite(IN2_R, HIGH); analogWrite(PWM_R, VELOCIDAD);
 }
 
 void detener() {
-  digitalWrite(IN1_L, LOW);
-  digitalWrite(IN2_L, LOW);
-  analogWrite(PWM_L, 0);
-
-  digitalWrite(IN1_R, LOW);
-  digitalWrite(IN2_R, LOW);
-  analogWrite(PWM_R, 0);
+  digitalWrite(IN1_L, LOW); digitalWrite(IN2_L, LOW); analogWrite(PWM_L, 0);
+  digitalWrite(IN1_R, LOW); digitalWrite(IN2_R, LOW); analogWrite(PWM_R, 0);
 }
 
-// ============================================================
-// DFPLAYER
-// ============================================================
-
+// -------------------- DFPLAYER --------------------
 void reproducirAudio(uint8_t track) {
+  if (track < 1 || track > 5) return;
+
   if (!dfPlayerOK) {
-    Serial.print(F("[DF] unavailable track="));
-    Serial.println(track);
-    sendNicla("ACK,AUD,0");
-    // MUY IMPORTANTE: recuperar RX del NICLA igualmente.
+    Serial.print(F("[DF] unavailable track=")); Serial.println(track);
+    sendNicla("K,A,0");
     niclaSerial.listen();
     return;
   }
 
   dfPlayer.play(track);
-
-  Serial.print(F("[DF] track="));
-  Serial.println(track);
-
-  sendAckAudio(track);
-
-  // dfPlayer usa otra instancia SoftwareSerial.
-  // Recuperar escucha del NICLA al terminar.
+  // SoftwareSerial TX to DFPlayer may temporarily own the listener.
   niclaSerial.listen();
+
+  Serial.print(F("[DF] track=")); Serial.println(track);
+  sendAckAudio(track);
 }
 
-// ============================================================
-// HC-SR04
-// ============================================================
-
+// -------------------- HC-SR04 --------------------
 float medirSensor(uint8_t trigPin, uint8_t echoPin) {
   digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
-
   digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
   const unsigned long duration = pulseIn(echoPin, HIGH, ECHO_TIMEOUT_US);
-
-  if (duration == 0) {
-    return -1.0f;
-  }
-
+  if (duration == 0) return -1.0f;
   return (duration * 0.0343f) / 2.0f;
 }
 
 void updateSensors() {
   distL = medirSensor(TRIG_L, ECHO_L);
-
-  // Evita que el mismo pulso acustico se interprete por el segundo sensor.
-  delay(6);
-
+  delay(4);
   distR = medirSensor(TRIG_R, ECHO_R);
 }
 
-// ============================================================
-// TELEMETRIA UNO -> NICLA
-// ============================================================
-
-void sendTelemetry() {
-  niclaSerial.print(F("TEL,DL="));
-  niclaSerial.print(distL, 1);
-
-  niclaSerial.print(F(",DR="));
-  niclaSerial.print(distR, 1);
-
-  niclaSerial.print(F(",DF="));
-  niclaSerial.print(dfPlayerOK ? 1 : 0);
-
-  niclaSerial.print(F(",PWM="));
-  niclaSerial.print(VELOCIDAD);
-
-  niclaSerial.print(F(",STATE="));
-  niclaSerial.println(currentMotion);
-}
-
+// -------------------- NICLA TX --------------------
 void sendNicla(const char *line) {
-  niclaSerial.println(line);
+  niclaSerial.print(line);
+  niclaSerial.write('\n');
+  niclaSerial.listen();
 }
 
 void sendAckCommand(char cmd) {
-  niclaSerial.print(F("ACK,CMD,"));
-  niclaSerial.println(cmd);
+  niclaSerial.print(F("K,M,"));
+  niclaSerial.write(cmd);
+  niclaSerial.write('\n');
+  niclaSerial.listen();
 }
 
 void sendAckAudio(uint8_t track) {
-  niclaSerial.print(F("ACK,AUD,"));
-  niclaSerial.println(track);
+  niclaSerial.print(F("K,A,"));
+  niclaSerial.print(track);
+  niclaSerial.write('\n');
+  niclaSerial.listen();
+}
+
+void sendTelemetry() {
+  // Compact integer-centimeter values reduce the SoftwareSerial TX window.
+  const int leftCm = (distL < 0.0f) ? -1 : (int)(distL + 0.5f);
+  const int rightCm = (distR < 0.0f) ? -1 : (int)(distR + 0.5f);
+
+  niclaSerial.print(F("T,"));
+  niclaSerial.print(leftCm); niclaSerial.write(',');
+  niclaSerial.print(rightCm); niclaSerial.write(',');
+  niclaSerial.print(dfPlayerOK ? 1 : 0); niclaSerial.write(',');
+  niclaSerial.write(currentMotion); niclaSerial.write(',');
+  niclaSerial.print((unsigned int)(rxBadBytes > 65535UL ? 65535UL : rxBadBytes)); niclaSerial.write(',');
+  niclaSerial.print((unsigned int)(softwareRxOverflows > 65535UL ? 65535UL : softwareRxOverflows)); niclaSerial.write(',');
+  niclaSerial.println((unsigned int)(rxLineOverflows > 65535UL ? 65535UL : rxLineOverflows));
+  niclaSerial.listen();
+
+  Serial.print(F("[UART] poll -> T; bad="));
+  Serial.print(rxBadBytes);
+  Serial.print(F(" ovf="));
+  Serial.print(softwareRxOverflows);
+  Serial.print(F(" line="));
+  Serial.println(rxLineOverflows);
 }

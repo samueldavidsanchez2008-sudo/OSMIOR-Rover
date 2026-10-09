@@ -1,4 +1,4 @@
-# OSMIOR - NICLA Vision / OpenMV 5.x
+# OSMIOR V3 - NICLA Vision / OpenMV 5.x
 # ============================================================
 # Arquitectura:
 #   HMI <-> WiFi/TCP <-> NICLA <-> UART4 <-> UNO
@@ -41,7 +41,7 @@ UART_BAUD = 9600
 
 HMI_WATCHDOG_MS = 2500
 
-TELEMETRY_PERIOD_MS = 200      # 5 Hz
+TELEMETRY_PERIOD_MS = 200      # HMI 5 Hz; UNO UART telemetry poll at 2 Hz
 IMU_PERIOD_MS = 50             # 20 Hz
 VISION_PERIOD_MS = 500         # 2 Hz
 MEM_REPORT_PERIOD_MS = 5000
@@ -139,6 +139,22 @@ uno_pwm = PWM_COMMAND
 uno_dl = -1.0
 uno_dr = -1.0
 last_uno_ack = "NONE"
+
+# UART half-duplex scheduler: motion/audio queued while UNO is transmitting.
+UART_POLL_PERIOD_MS = 500
+UART_BUSY_MOTION_MS = 12
+UART_BUSY_AUDIO_MS = 18
+UART_BUSY_POLL_MS = 55
+UART_BUSY_GUARD_MS = 2
+uart_busy_until_ms = 0
+last_uart_poll_ms = 0
+pending_motion = None          # (command, HMI sequence)
+pending_audio = []             # [(track, HMI sequence), ...]
+pending_uart_acks = []         # [(type, code, seq, sent_ticks), ...]
+uart_rx_bad_bytes = 0
+uno_rx_bad_bytes = 0
+uno_sw_overflows = 0
+uno_line_overflows = 0
 
 # Drive-time estimator.
 drive_time_ms = 0
@@ -524,21 +540,65 @@ def battery_estimate():
 
 
 # ------------------------------------------------------------
-# AUDIO
+# AUDIO / NICLA -> UNO UART scheduler
 # ------------------------------------------------------------
+def queue_uart_ack(kind, code, seq, sent_ms):
+    # Bounded tracking list; stale ACK records must not consume RAM forever.
+    if len(pending_uart_acks) >= 10:
+        pending_uart_acks.pop(0)
+    pending_uart_acks.append((kind, str(code), int(seq or 0), sent_ms))
 
-def play_audio(track):
+
+def enqueue_motion(cmd, seq=0):
+    global pending_motion, motion_command
+    cmd = str(cmd).upper()
+    if cmd not in ("F", "B", "L", "R", "S"):
+        return False
+
+    motion_command = cmd
+    if pending_motion is not None:
+        old_cmd, old_seq = pending_motion
+        if old_seq:
+            send_hmi("EVT;CMD_SUPERSEDED;SEQ={}".format(old_seq))
+    pending_motion = (cmd, int(seq or 0))  # last motion wins; STOP can supersede F
+    return True
+
+
+def enqueue_audio(track, seq=0):
+    if track < 1 or track > 5:
+        return False
+    if len(pending_audio) >= 5:
+        pending_audio.pop(0)
+    pending_audio.append((int(track), int(seq or 0)))
+    return True
+
+
+def send_uno(line, seq=0):
+    """Compatibility wrapper; queues commands instead of writing full text frames."""
+    upper = line.strip().upper()
+    if upper.startswith("CMD,") and len(upper) >= 5:
+        return enqueue_motion(upper[4], seq)
+    if upper.startswith("AUD,"):
+        track = safe_int(upper[4:].split(",", 1)[0], 0)
+        return enqueue_audio(track, seq)
+    if upper in ("F", "B", "L", "R", "S"):
+        return enqueue_motion(upper, seq)
+    return False
+
+
+def play_audio(track, seq=0, force=False):
     now = now_ms()
-
     cooldown = PERSON_AUDIO_COOLDOWN_MS if track == 5 else AUDIO_COOLDOWN_MS
     last = last_audio.get(track, -100000)
 
-    if elapsed(last, now) < cooldown:
+    # Track 3 is an explicit user request, so don't silently suppress it.
+    if not force and track != 3 and elapsed(last, now) < cooldown:
         return False
 
-    send_uno("AUD," + str(track))
-    last_audio[track] = now
-    return True
+    queued = enqueue_audio(track, seq)
+    if queued:
+        last_audio[track] = now
+    return queued
 
 
 def update_audio_events():
@@ -549,12 +609,10 @@ def update_audio_events():
     tilt_state, tilt = calculate_tilt_state()
     battery_pct, _ = battery_estimate()
 
-    # Person: rising edge + cooldown.
     if person_detected and not person_previous:
         play_audio(5)
     person_previous = person_detected
 
-    # Critical tilt: RED at 5 deg before theoretical critical.
     if tilt_state == "RED":
         if not critical_audio_latched:
             play_audio(4)
@@ -562,7 +620,6 @@ def update_audio_events():
     elif tilt < RED_ANGLE_DEG - 2.0:
         critical_audio_latched = False
 
-    # Low battery: one event per low-battery episode.
     if battery_pct <= LOW_BATTERY_PCT:
         if not low_battery_latched:
             play_audio(2)
@@ -572,96 +629,158 @@ def update_audio_events():
 
 
 # ------------------------------------------------------------
-# UNO UART
+# UNO UART - ASCII bytes only, no Unicode decode
 # ------------------------------------------------------------
-
-def send_uno(line):
-    try:
-        uart.write((line + "\n").encode("ascii"))
-        return True
-    except Exception as exc:
-        print("UART TX ERROR", repr(exc))
-        return False
-
-
-def apply_motion_command(cmd):
-    global motion_command
-
-    cmd = cmd.upper()
-
-    if cmd not in ("F", "B", "L", "R", "S"):
-        return False
-
-    motion_command = cmd
-    send_uno("CMD," + cmd)
-    return True
-
-
 def parse_uno_line(line):
     global uno_dl, uno_dr, uno_df_ok, uno_pwm
-    global uno_state, last_uno_ack
+    global uno_state, last_uno_ack, uart_busy_until_ms
+    global uno_rx_bad_bytes, uno_sw_overflows, uno_line_overflows
 
     line = line.strip()
-
     if not line:
         return
 
-    if line.startswith("TEL,"):
+    now = now_ms()
+
+    if line.startswith("T,"):
+        # Compact response: T,DL_cm,DR_cm,DF,STATE,RX_BAD,OVF,LINE_BAD
         parts = line.split(",")
-        for token in parts[1:]:
-            if token.startswith("DL="):
-                uno_dl = safe_float(token[3:], -1.0)
-            elif token.startswith("DR="):
-                uno_dr = safe_float(token[3:], -1.0)
-            elif token.startswith("DF="):
-                uno_df_ok = safe_int(token[3:], 0)
-            elif token.startswith("PWM="):
-                uno_pwm = safe_int(token[4:], PWM_COMMAND)
-            elif token.startswith("STATE="):
-                uno_state = token[6:]
+        if len(parts) >= 8:
+            uno_dl = safe_float(parts[1], -1.0)
+            uno_dr = safe_float(parts[2], -1.0)
+            uno_df_ok = safe_int(parts[3], 0)
+            uno_state = parts[4]
+            uno_rx_bad_bytes = safe_int(parts[5], 0)
+            uno_sw_overflows = safe_int(parts[6], 0)
+            uno_line_overflows = safe_int(parts[7], 0)
+        uart_busy_until_ms = time.ticks_add(now, UART_BUSY_GUARD_MS)
         return
 
-    if line.startswith("ACK,"):
-        last_uno_ack = line[4:]
-        send_hmi("EVT;UNO_ACK=" + last_uno_ack)
+    if line.startswith("K,"):
+        # Compact ACK: K,M,F or K,A,5
+        parts = line.split(",")
+        if len(parts) >= 3:
+            kind = parts[1]
+            code = parts[2]
+            last_uno_ack = kind + "," + code
+            matched = None
+            for i, record in enumerate(pending_uart_acks):
+                if record[0] == kind and record[1] == code:
+                    matched = pending_uart_acks.pop(i)
+                    break
+
+            if matched is not None:
+                _kind, _code, seq, sent_ms = matched
+                uart_ms = elapsed(sent_ms, now)
+                event = "EVT;ACK;TYPE={};CMD={};SEQ={};UART_MS={}".format(
+                    kind, code, seq, uart_ms
+                )
+                print("UART ACK", kind, code, "seq=", seq, "latency_ms=", uart_ms)
+                send_hmi(event)
+            else:
+                send_hmi("EVT;ACK;TYPE={};CMD={};SEQ=0".format(kind, code))
+        uart_busy_until_ms = time.ticks_add(now, UART_BUSY_GUARD_MS)
         return
 
     if line.startswith("READY,"):
         send_hmi("EVT;UNO=" + line[6:])
         return
 
-    if line.startswith("PONG"):
+    if line == "PONG":
         send_hmi("EVT;UNO=PONG")
-        return
-
-    if line.startswith("ERR,"):
-        send_hmi("EVT;UNO_ERR=" + line[4:])
         return
 
 
 def read_uno_uart():
-    global uno_rx_buffer
+    global uno_rx_buffer, uart_rx_bad_bytes
 
     try:
-        if not uart.any():
+        count = uart.any()
+        if not count:
             return
-
-        data = uart.read()
+        data = uart.read(count)
         if not data:
             return
 
-        uno_rx_buffer += data.decode("ascii", "ignore")
+        # Parse bytes directly. Never decode random UART bytes as Unicode.
+        for byte in data:
+            if not isinstance(byte, int):
+                byte = ord(byte)
 
-        if len(uno_rx_buffer) > 400:
-            uno_rx_buffer = ""
-            return
+            if byte == 13:  # CR
+                continue
+            if byte == 10:  # LF
+                if uno_rx_buffer:
+                    parse_uno_line(uno_rx_buffer)
+                uno_rx_buffer = ""
+                continue
 
-        while "\n" in uno_rx_buffer:
-            line, uno_rx_buffer = uno_rx_buffer.split("\n", 1)
-            parse_uno_line(line)
+            if 32 <= byte <= 126:
+                if len(uno_rx_buffer) < 100:
+                    uno_rx_buffer += chr(byte)
+                else:
+                    uno_rx_buffer = ""
+                    uart_rx_bad_bytes += 1
+            else:
+                uart_rx_bad_bytes += 1
+                # Ignore invalid byte but preserve the rest of the frame.
 
     except Exception as exc:
         print("UART RX ERROR", repr(exc))
+
+
+def expire_uart_acks(now):
+    # A lost/corrupt ACK must not block telemetry polling or future commands forever.
+    for i in range(len(pending_uart_acks) - 1, -1, -1):
+        record = pending_uart_acks[i]
+        if elapsed(record[3], now) > 300:
+            pending_uart_acks.pop(i)
+            kind, code, seq, sent_ms = record
+            print("UART ACK TIMEOUT", kind, code, "seq=", seq)
+            send_hmi("EVT;ACK_TIMEOUT;TYPE={};CMD={};SEQ={}".format(kind, code, seq))
+
+
+def flush_uno_actions(now):
+    """Send one short transaction at a time to avoid UNO SoftwareSerial TX/RX overlap."""
+    global pending_motion, last_uart_poll_ms, uart_busy_until_ms
+
+    if time.ticks_diff(now, uart_busy_until_ms) < 0:
+        return
+
+    if pending_motion is not None:
+        cmd, seq = pending_motion
+        pending_motion = None
+        sent_ms = now_ms()
+        try:
+            uart.write(cmd.encode("ascii"))  # one byte; UNO acts immediately
+            queue_uart_ack("M", cmd, seq, sent_ms)
+            uart_busy_until_ms = time.ticks_add(sent_ms, UART_BUSY_MOTION_MS)
+            print("UART TX motion", cmd, "seq=", seq)
+        except Exception as exc:
+            print("UART TX ERROR motion", repr(exc))
+        return
+
+    if pending_audio:
+        track, seq = pending_audio.pop(0)
+        sent_ms = now_ms()
+        try:
+            uart.write(("A" + str(track)).encode("ascii"))  # two bytes
+            queue_uart_ack("A", track, seq, sent_ms)
+            uart_busy_until_ms = time.ticks_add(sent_ms, UART_BUSY_AUDIO_MS)
+            print("UART TX audio", track, "seq=", seq)
+        except Exception as exc:
+            print("UART TX ERROR audio", repr(exc))
+        return
+
+    # Poll only when no command is queued and no ACK is outstanding.
+    if (not pending_uart_acks and
+            elapsed(last_uart_poll_ms, now) >= UART_POLL_PERIOD_MS):
+        try:
+            uart.write(b"?")
+            last_uart_poll_ms = now
+            uart_busy_until_ms = time.ticks_add(now, UART_BUSY_POLL_MS)
+        except Exception as exc:
+            print("UART TX ERROR poll", repr(exc))
 
 
 # ------------------------------------------------------------
@@ -686,7 +805,7 @@ def close_client():
     global client, client_addr, hmi_rx_buffer
 
     # Safety first: network loss -> stop rover.
-    apply_motion_command("S")
+    enqueue_motion("S", 0)
 
     if client is not None:
         try:
@@ -751,30 +870,33 @@ def handle_hmi_line(line):
         send_hmi("PONG")
         return
 
-    # New protocol.
-    if upper.startswith("CMD,") and len(upper) >= 5:
-        apply_motion_command(upper[4])
+    if upper.startswith("CMD,"):
+        parts = upper.split(",")
+        if len(parts) >= 2 and parts[1] and parts[1][0] in ("F", "B", "L", "R", "S"):
+            seq = safe_int(parts[2], 0) if len(parts) >= 3 else 0
+            enqueue_motion(parts[1][0], seq)
         return
 
     if upper.startswith("AUD,"):
-        track = safe_int(upper[4:], 0)
+        parts = upper.split(",")
+        track = safe_int(parts[1], 0) if len(parts) >= 2 else 0
+        seq = safe_int(parts[2], 0) if len(parts) >= 3 else 0
         if 1 <= track <= 5:
+            # Track 3 is the explicit HMI query; play immediately when requested.
             if track == 3:
-                # Manual person query from HMI.
-                play_audio(3)
+                play_audio(3, seq, force=True)
             else:
-                send_uno("AUD," + str(track))
+                play_audio(track, seq)
         return
 
-    # Compatibility with older HMI.
     if upper in ("F", "B", "L", "R", "S"):
-        apply_motion_command(upper)
+        enqueue_motion(upper, 0)
         return
 
     if upper.startswith("AUD:"):
         track = safe_int(upper[4:], 0)
         if 1 <= track <= 5:
-            send_uno("AUD," + str(track))
+            play_audio(track)
         return
 
 
@@ -863,6 +985,10 @@ def build_telemetry():
         "REMAIN={:.1f};"
         "DF={};"
         "PWM={};"
+        "URXBAD={};"
+        "UOVF={};"
+        "NURXBAD={};"
+        "ULINE={};"
         "MODE=MANUAL"
     ).format(
         ax_g, ay_g, az_g,
@@ -888,6 +1014,10 @@ def build_telemetry():
         remaining_min,
         uno_df_ok,
         uno_pwm,
+        uart_rx_bad_bytes,
+        uno_sw_overflows,
+        uno_rx_bad_bytes,
+        uno_line_overflows,
     )
 
 
@@ -929,7 +1059,7 @@ def init_system():
     last_hmi_rx_ms = now_ms()
 
     print("============================================")
-    print("OSMIOR NICLA GATEWAY")
+    print("OSMIOR NICLA V3 GATEWAY")
     print("IP:", ap.ifconfig()[0])
     print("TCP:", TCP_PORT)
     print("UART4: SDA=TX / SCL=RX")
@@ -940,7 +1070,7 @@ def init_system():
     print("============================================")
 
     # Start UNO stopped.
-    send_uno("CMD,S")
+    enqueue_motion("S", 0)
 
 
 # ------------------------------------------------------------
@@ -957,6 +1087,7 @@ while True:
     accept_hmi()
     read_hmi()
     read_uno_uart()
+    flush_uno_actions(now)
 
     if elapsed(last_imu_ms, now) >= IMU_PERIOD_MS:
         read_imu_update()

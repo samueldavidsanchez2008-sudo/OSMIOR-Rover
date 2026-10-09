@@ -56,6 +56,8 @@ class NetworkWorker(QThread):
         self.running = True
         self.tx_queue = queue.Queue()
         self.sock = None
+        self.sequence = 0
+        self.pending_times = {}
 
     def stop(self):
         self.running = False
@@ -134,7 +136,33 @@ class NetworkWorker(QThread):
             if item == "STOP_LOCAL":
                 continue
 
-            sock.sendall((item.strip() + "\n").encode("ascii"))
+            wire_line = item.strip()
+            seq = None
+            upper = wire_line.upper()
+
+            # Number commands at the HMI so each UNO ACK can be timed.
+            if upper.startswith("CMD,") or upper.startswith("AUD,"):
+                fields = wire_line.split(",")
+                if len(fields) == 2:
+                    self.sequence = (self.sequence + 1) % 1000000
+                    if self.sequence == 0:
+                        self.sequence = 1
+                    seq = self.sequence
+                    wire_line = wire_line + "," + str(seq)
+                elif len(fields) >= 3:
+                    try:
+                        seq = int(fields[2])
+                    except ValueError:
+                        seq = None
+
+            sock.sendall((wire_line + "\n").encode("ascii"))
+
+            if seq is not None:
+                self.pending_times[seq] = (time.monotonic(), item)
+                # Bound the map in case a command never receives an ACK.
+                if len(self.pending_times) > 32:
+                    oldest = next(iter(self.pending_times))
+                    self.pending_times.pop(oldest, None)
 
     def run(self):
         while self.running:
@@ -185,6 +213,28 @@ class NetworkWorker(QThread):
                                 continue
 
                             if line.startswith("EVT;"):
+                                if "CMD_SUPERSEDED;" in line:
+                                    try:
+                                        seq_text = [p.split("=", 1)[1] for p in line.split(";") if p.startswith("SEQ=")][0]
+                                        self.pending_times.pop(int(seq_text), None)
+                                    except Exception:
+                                        pass
+                                if "ACK;" in line:
+                                    try:
+                                        seq_text = [p.split("=", 1)[1] for p in line.split(";") if p.startswith("SEQ=")][0]
+                                        seq = int(seq_text)
+                                        pending = self.pending_times.pop(seq, None)
+                                        if pending is not None:
+                                            rtt_ms = (time.monotonic() - pending[0]) * 1000.0
+                                            line += ";RTT_MS={:.1f}".format(rtt_ms)
+                                    except Exception:
+                                        pass
+                                elif "ACK_TIMEOUT;" in line:
+                                    try:
+                                        seq_text = [p.split("=", 1)[1] for p in line.split(";") if p.startswith("SEQ=")][0]
+                                        self.pending_times.pop(int(seq_text), None)
+                                    except Exception:
+                                        pass
                                 self.event.emit(line[4:])
                             elif line.startswith("READY;"):
                                 self.event.emit(line)
@@ -369,7 +419,7 @@ class HMI(QMainWindow):
         # Header.
         header = QHBoxLayout()
 
-        self.title = QLabel("OSMIOR // ROVER CONTROL TERMINAL")
+        self.title = QLabel("OSMIOR // ROVER CONTROL TERMINAL V3")
         self.title.setObjectName("title")
 
         self.conn_label = QLabel("DESCONECTADO")
@@ -534,7 +584,8 @@ class HMI(QMainWindow):
 
         self.person_label = QLabel("PERSON: --")
         self.distance_label = QLabel("HC-SR04 L: -- cm | R: -- cm")
-        self.motion_label = QLabel("UNO CMD: S | ACK: --")
+        self.motion_label = QLabel("UNO CMD: S | ACK RTT: -- ms")
+        self.uart_diag_label = QLabel("UART: RX bad=0 | UNO overflow=0")
         self.imu_label = QLabel("PITCH: -- | ROLL: --")
         self.torque_label = QLabel("TAU/MOTOR: -- N*m | F: -- N")
         self.speed_label = QLabel("V THEORY: -- | V IMU: -- m/s")
@@ -545,6 +596,7 @@ class HMI(QMainWindow):
             self.person_label,
             self.distance_label,
             self.motion_label,
+            self.uart_diag_label,
             self.imu_label,
             self.torque_label,
             self.speed_label,
@@ -693,9 +745,23 @@ class HMI(QMainWindow):
     def update_event(self, event):
         self.last_event_label.setText("EVENT: " + event)
 
-        if event.startswith("UNO_ACK=CMD,"):
-            cmd = event.split("=", 1)[1]
-            self.motion_label.setText(f"UNO CMD: {cmd[-1]} | ACK: {cmd}")
+        parts = event.split(";")
+        fields = {}
+        for part in parts:
+            if "=" in part:
+                key, value = part.split("=", 1)
+                fields[key] = value
+
+        if fields.get("TYPE") == "M" and "CMD" in fields:
+            rtt = fields.get("RTT_MS", "--")
+            self.motion_label.setText(
+                "UNO CMD: {} | ACK RTT: {} ms".format(fields["CMD"], rtt)
+            )
+        elif fields.get("TYPE") == "A" and "CMD" in fields:
+            rtt = fields.get("RTT_MS", "--")
+            self.motion_label.setText(
+                "UNO AUDIO: {} | ACK RTT: {} ms".format(fields["CMD"], rtt)
+            )
 
     @pyqtSlot(dict)
     def update_telemetry(self, data):
@@ -739,6 +805,15 @@ class HMI(QMainWindow):
 
         self.distance_label.setText(
             f"HC-SR04 L: {data.get('DL', -1):.1f} cm | R: {data.get('DR', -1):.1f} cm"
+        )
+
+        self.uart_diag_label.setText(
+            "UART: NICLA bad={} | UNO bad={} | RX overflow={} | malformed={}".format(
+                int(data.get("URXBAD", 0)),
+                int(data.get("NURXBAD", 0)),
+                int(data.get("UOVF", 0)),
+                int(data.get("ULINE", 0)),
+            )
         )
 
         self.imu_label.setText(f"PITCH: {pitch:+.1f} | ROLL: {roll:+.1f} deg")
