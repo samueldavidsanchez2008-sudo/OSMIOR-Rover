@@ -1,0 +1,234 @@
+
+\documentclass[12pt,a4paper]{article}
+\usepackage[spanish]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{booktabs}
+\setlength{\parskip}{0.45em}
+\setlength{\parindent}{0pt}
+\title{OSMIOR: La física detrás del rover\\Guion de presentación para ExpoFísica}
+\author{}
+\date{}
+\begin{document}
+\maketitle
+
+\section*{Estructura}
+Cuatro expositores, siete gráficas centrales, sin incluir la gráfica de los sensores ultrasónicos. Se explica la física detrás del rover, la relación entre ecuaciones y sistema, y la interpretación de resultados. Hay que distinguir entre magnitudes medidas, calculadas por el programa y estimaciones de modelos.
+
+\section{Persona 1: Velocidad y deslizamiento}
+\subsection{Gráfica 1: Velocidad teórica y velocidad estimada}
+\textbf{Guion.} Para controlar los motores utilizamos una señal PWM, que regula la potencia promedio entregada mediante la variación del ciclo de trabajo. El PWM controla el movimiento, pero no mide directamente la velocidad de las ruedas. La velocidad lineal teórica se obtiene a partir de la velocidad angular y el radio de la rueda. También podemos estimar la velocidad integrando la aceleración longitudinal medida por la IMU.
+
+\textbf{Ciclo de trabajo PWM:}
+\[
+D=\frac{t_{\mathrm{ON}}}{T}\times100\%
+\]
+\textbf{Velocidad angular a partir de RPM:}
+\[
+\omega=\frac{2\pi\,RPM}{60}
+\]
+\textbf{Velocidad lineal teórica:}
+\[
+\boxed{v_{\mathrm{teórica}}=\omega r}
+\]
+\textbf{Velocidad estimada mediante aceleración:}
+\[
+\boxed{v(t)=v_0+\int_0^t a_x(t)\,dt}
+\qquad
+v_k=v_{k-1}+a_{x,k}\Delta t
+\]
+
+\textbf{Ejemplo.} PWM de 180 en una escala de 0 a 255:
+\[
+D=\frac{180}{255}\times100\%\approx70.6\%
+\]
+Esto no significa que el motor gire al 70.6\% de sus RPM máximas. Para un ejemplo teórico, si la rueda gira a 60 RPM y su radio es \(0.05\,\mathrm{m}\):
+\[
+\omega=\frac{2\pi(60)}{60}=2\pi\,\mathrm{rad/s}
+\]
+\[
+v_{\mathrm{teórica}}=2\pi(0.05)\approx0.314\,\mathrm{m/s}
+\]
+Si la IMU registra \(0.20\,\mathrm{m/s^2}\) durante \(2\,\mathrm{s}\), partiendo del reposo y suponiendo aceleración constante:
+\[
+v_{\mathrm{estimada}}=0+(0.20)(2)=0.40\,\mathrm{m/s}
+\]
+Son valores ilustrativos; la estimación puede diferir por ruido, inclinación, errores de integración y dinámica del vehículo. El PWM es la señal de control; la velocidad es una magnitud física.
+
+\subsection{Gráfica 2: Deslizamiento o patinaje}
+\textbf{Guion.} Que una rueda gire no garantiza que el rover avance en la misma proporción. Si pierde adherencia, la rueda puede girar mientras el desplazamiento efectivo disminuye. El factor de deslizamiento cuantifica esa diferencia.
+\[
+\boxed{s=1-\frac{v_{\mathrm{real}}}{v_{\mathrm{teórica}}}}
+\qquad
+s_{\%}=s\times100\%
+\]
+\textbf{Ejemplo:}
+\[
+s=1-\frac{0.30}{0.40}=0.25
+\qquad
+\boxed{s=25\%}
+\]
+Existe una diferencia del 25\% entre la velocidad teórica y la estimada. Puede deberse a deslizamiento, pero también a errores de estimación. Este cálculo requiere ambas velocidades comparables; sin encoders ni medición independiente del desplazamiento, no debe presentarse como medición directa del patinaje.
+
+\section{Persona 2: Fuerza de tracción y torque}
+\subsection{Gráfica 3: Demanda de fuerza de tracción}
+\textbf{Guion.} Al subir una pendiente, la gravedad genera una componente del peso que se opone al movimiento. El rover necesita más fuerza de tracción que en terreno horizontal. El modelo también considera la resistencia a la rodadura.
+\[
+F_g=mg\sin\theta
+\]
+\[
+F_{rr}=C_{rr}mg\cos\theta
+\]
+\[
+\boxed{F_{\mathrm{req}}=mg\sin\theta+C_{rr}mg\cos\theta}
+\]
+Aquí \(m\) es la masa, \(g\) la aceleración gravitacional, \(\theta\) el ángulo de pendiente y \(C_{rr}\) el coeficiente de rodadura.
+
+\textbf{Ejemplo.} Con \(m=5\,\mathrm{kg}\), \(\theta=20^\circ\), \(C_{rr}=0.05\):
+\[
+F_g=(5)(9.81)\sin20^\circ\approx16.77\,\mathrm{N}
+\]
+\[
+F_{rr}=0.05(5)(9.81)\cos20^\circ\approx2.30\,\mathrm{N}
+\]
+\[
+\boxed{F_{\mathrm{req}}\approx16.77+2.30=19.07\,\mathrm{N}}
+\]
+Bajo estos supuestos, la fuerza de tracción requerida es aproximadamente \(19.07\,\mathrm{N}\), sin incluir otras pérdidas.
+
+\subsection{Gráfica 4: Torque requerido por los motores}
+\textbf{Guion.} La fuerza de tracción se relaciona con el torque en el eje de la rueda. A mayor radio, se necesita mayor torque para producir la misma fuerza en el contacto con el suelo. En el HMI se estima esta demanda mediante un modelo mecánico, no con una medición directa del torque.
+\[
+\boxed{\tau=Fr}
+\]
+\[
+\tau=I\alpha+F_{\mathrm{resistencia}}r
+\]
+\[
+\boxed{\tau_{\mathrm{total}}=F_{\mathrm{req}}r}
+\qquad
+\boxed{\tau_{\mathrm{motor}}=\frac{F_{\mathrm{req}}r}{2}}
+\]
+La última expresión supone dos motores compartiendo la carga por igual.
+
+\textbf{Ejemplo.} Con \(F_{\mathrm{req}}=19.07\,\mathrm{N}\) y \(r=0.05\,\mathrm{m}\):
+\[
+\tau_{\mathrm{total}}=(19.07)(0.05)\approx0.954\,\mathrm{N\,m}
+\]
+\[
+\tau_{\mathrm{motor}}=\frac{0.954}{2}\approx0.477\,\mathrm{N\,m}
+\]
+Si aumenta la pendiente, aumenta la componente del peso paralela al terreno y, normalmente, el torque requerido. El torque efectivo también depende de la transmisión, pérdidas, adherencia y distribución real de la carga.
+
+\section{Persona 3: Orientación y distribución de carga}
+\subsection{Gráfica 5: Pitch y roll}
+\textbf{Guion.} La IMU integra acelerómetro y giroscopio. El acelerómetro permite inferir la inclinación a partir de la gravedad en condiciones de movimiento moderado; el giroscopio mide velocidad angular. Un filtro complementario combina ambas señales.
+\[
+\boxed{\theta_{\mathrm{acc}}=
+\operatorname{atan2}\left(a_x,\sqrt{a_y^2+a_z^2}\right)}
+\]
+\[
+\boxed{\phi_{\mathrm{acc}}=
+\operatorname{atan2}\left(a_y,\sqrt{a_x^2+a_z^2}\right)}
+\]
+La asignación de ejes y signos depende de la orientación de montaje de la IMU.
+\[
+\theta_{\mathrm{gyro},k}=\theta_{k-1}+\omega_k\Delta t
+\]
+\[
+\boxed{\theta_k=
+\alpha\left(\theta_{k-1}+\omega_k\Delta t\right)
++(1-\alpha)\theta_{\mathrm{acc}}}
+\]
+Se usa una expresión análoga para roll. En el código, \(\alpha=0.98\).
+
+\textbf{Ejemplo.} Si el giroscopio registra \(20^\circ/\mathrm{s}\) durante \(0.5\,\mathrm{s}\):
+\[
+\Delta\theta\approx\omega\Delta t=(20)(0.5)=10^\circ
+\]
+El filtro combina esta variación con la inclinación inferida por el acelerómetro. Pitch es la inclinación longitudinal; roll es la inclinación lateral.
+
+\subsection{Gráfica 6: Distribución de la fuerza normal}
+\textbf{Guion.} La fuerza normal es la fuerza de contacto perpendicular a la superficie. Al inclinarse el rover, la carga se redistribuye entre los apoyos delanteros y traseros. El modelo considera masa, distancia entre ejes, altura del centro de masa y ángulo de inclinación.
+
+\(L\) es la distancia entre apoyos; \(L_f\), la distancia del centro de masa al apoyo delantero; \(L_r\), la distancia al apoyo trasero; \(h\), la altura del centro de masa; \(L=L_f+L_r\).
+\[
+\boxed{N_{\mathrm{trasera}}=
+mg\left(\frac{L_f\cos\theta+h\sin\theta}{L}\right)}
+\]
+\[
+\boxed{N_{\mathrm{delantera}}=
+mg\left(\frac{L_r\cos\theta-h\sin\theta}{L}\right)}
+\]
+En terreno horizontal, \(\theta=0^\circ\):
+\[
+N_{\mathrm{trasera}}=mg\frac{L_f}{L},
+\qquad
+N_{\mathrm{delantera}}=mg\frac{L_r}{L}
+\]
+Bajo el modelo estático horizontal, la suma es \(mg\).
+
+\textbf{Ejemplo.} Supongamos \(m=5\,\mathrm{kg}\), \(L=0.30\,\mathrm{m}\), \(L_f=L_r=0.15\,\mathrm{m}\), \(h=0.10\,\mathrm{m}\) y \(\theta=20^\circ\):
+\[
+N_{\mathrm{trasera}}=
+49.05\left(\frac{0.15\cos20^\circ+0.10\sin20^\circ}{0.30}\right)
+\]
+\[
+\boxed{N_{\mathrm{trasera}}\approx31.7\,\mathrm{N}}
+\]
+\[
+N_{\mathrm{delantera}}=
+49.05\left(\frac{0.15\cos20^\circ-0.10\sin20^\circ}{0.30}\right)
+\]
+\[
+\boxed{N_{\mathrm{delantera}}\approx14.4\,\mathrm{N}}
+\]
+Al subir la pendiente, la carga se transfiere hacia atrás. La suma aproximada es \(46.1\,\mathrm{N}\), menor que \(mg\approx49.1\,\mathrm{N}\), porque en una pendiente las normales son perpendiculares al terreno y no equivalen por sí solas al peso. Es un modelo estático simplificado; la distribución real también depende de aceleración, suspensión y contactos con el terreno.
+
+\section{Persona 4: Límite de estabilidad}
+\subsection{Gráfica 7: Ángulo crítico}
+\textbf{Guion.} El ángulo crítico relaciona la inclinación del rover con su límite geométrico de estabilidad. Un cuerpo puede perder el equilibrio cuando la proyección de su centro de masa sale de la base de apoyo. Para una base longitudinal de longitud \(L\), centro de masa centrado y altura \(h\), el límite idealizado es:
+\[
+\tan\theta_{\mathrm{crit}}=\frac{L/2}{h}
+\]
+\[
+\boxed{\theta_{\mathrm{crit}}=\arctan\left(\frac{L}{2h}\right)}
+\]
+Para el límite lateral, usando el ancho de apoyo \(W\):
+\[
+\boxed{\phi_{\mathrm{crit}}=\arctan\left(\frac{W/2}{h}\right)}
+\]
+
+\textbf{Ejemplo.} Con \(L=0.30\,\mathrm{m}\) y \(h=0.10\,\mathrm{m}\):
+\[
+\theta_{\mathrm{crit}}=\arctan\left(\frac{0.30/2}{0.10}\right)
+\]
+\[
+\boxed{\theta_{\mathrm{crit}}\approx56.3^\circ}
+\]
+Es un límite geométrico idealizado, no una garantía de operación segura. La adherencia, suspensión, irregularidades y dinámica pueden reducir el margen real. Si el ángulo se aproxima al límite, aumenta el riesgo de perder el equilibrio.
+
+\section*{Cierre conjunto}
+OSMIOR conecta la Física con el comportamiento de un sistema real. El PWM controla el movimiento; la cinemática lo describe; la dinámica explica las fuerzas y el torque; y la estática permite analizar la distribución de carga y el margen de estabilidad. Al comparar modelos y comportamiento del rover, también reconocemos los límites de las aproximaciones teóricas. La HMI convierte la física en algo observable, cuantificable y discutible experimentalmente.
+
+\section*{Resumen de las siete gráficas}
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Gráfica & Concepto físico & Fórmula principal\\
+\midrule
+1. Velocidad & Cinemática lineal & \(v=\omega r\)\\
+2. Deslizamiento & Diferencia de velocidades & \(s=1-v_{\mathrm{real}}/v_{\mathrm{teórica}}\)\\
+3. Tracción & Fuerzas en pendiente & \(F_{\mathrm{req}}=mg\sin\theta+C_{rr}mg\cos\theta\)\\
+4. Torque & Momento de fuerza & \(\tau=Fr\)\\
+5. Pitch y roll & Orientación angular & \(\Delta\theta\approx\omega\Delta t\)\\
+6. Carga normal & Estática y momentos & \(N_{\mathrm{trasera}}=mg(L_f\cos\theta+h\sin\theta)/L\)\\
+7. Ángulo crítico & Centro de masa y equilibrio & \(\theta_{\mathrm{crit}}=\arctan(L/(2h))\)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Nota técnica.} Separar qué mide un sensor, qué calcula el programa y qué ilustra un ejemplo teórico. La ecuación del ángulo crítico es una deducción geométrica simplificada y no debe atribuirse al código si no está implementada allí.
+\end{document}
