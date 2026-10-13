@@ -1,0 +1,183 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage[spanish,es-nodecimaldot]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{siunitx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{cite}
+\usepackage{url}
+\usepackage{hyperref}
+
+\sisetup{per-mode=symbol,detect-all}
+\renewcommand{\IEEEkeywordsname}{Palabras clave}
+
+\title{Arquitectura de Alimentación y Estimación del Balance Energético del Rover OSMIOR}
+
+\author{
+\IEEEauthorblockN{Nombre del autor}
+\IEEEauthorblockA{
+Ingeniería Electrónica\\
+Universidad del Norte\\
+Barranquilla, Colombia\\
+correo@ejemplo.com}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Este artículo documenta la arquitectura electrónica de alimentación implementada en el rover OSMIOR para su demostración en ExpoFísica. Se actualiza el diseño respecto a una propuesta inicial y se describe el uso de un paquete de dos celdas Li-ion 18650 en serie, un convertidor reductor LM2596, una tarjeta Arduino Nicla Vision, un Arduino UNO, controladores de motores TB6612FNG, seis motorreductores TT y sensores ultrasónicos HC-SR04. Se formulan los cálculos eléctricos que pueden justificarse con los componentes conocidos y se identifican explícitamente las magnitudes que no pueden determinarse sin medir la capacidad real de las celdas, la corriente de operación y las pérdidas del sistema. En particular, las estimaciones de autonomía se expresan en función de la capacidad real del paquete, evitando asumir una configuración 2S2P o cargas de subsistemas que no forman parte de la versión implementada.
+\end{abstract}
+
+\begin{IEEEkeywords}
+OSMIOR, electrónica de potencia, rover, LM2596, TB6612FNG, batería Li-ion, balance energético.
+\end{IEEEkeywords}
+
+\section{Introducción}
+El subsistema electrónico de OSMIOR debe alimentar tanto la etapa de procesamiento y comunicación como la tracción de seis motorreductores de corriente continua. La conmutación de los motores genera variaciones de corriente y perturbaciones que pueden provocar caídas de tensión en el bus de alimentación. Durante las pruebas se observó que el rover podía mantener la tracción mientras la Nicla Vision se reiniciaba o perdía su punto de acceso inalámbrico al accionar los motores. Este comportamiento es compatible con una caída transitoria de la tensión de alimentación, aunque para confirmar la causa se requiere medir la tensión en la entrada de la Nicla durante el arranque y el bloqueo de los motores.
+
+La arquitectura descrita aquí corresponde a los componentes utilizados o identificados en la versión actual del rover. No se consideran instalados los módulos Heltec LoRa, BME280, MPU6050 externo, servomotores, encoders ni sensores de corriente mencionados en el documento preliminar, porque no forman parte del montaje operativo confirmado. La Nicla Vision incorpora los recursos de visión e inerciales usados por el sistema.
+
+\section{Arquitectura implementada}
+\subsection{Fuente primaria}
+La fuente está formada por dos celdas Li-ion formato 18650 conectadas en serie (configuración 2S). Por tanto, las tensiones nominales de referencia son:
+\begin{equation}
+V_{\mathrm{pack,nom}} = 2(3.7)=\SI{7.4}{V}
+\end{equation}
+y, con ambas celdas cargadas a \SI{4.2}{V}:
+\begin{equation}
+V_{\mathrm{pack,max}} = 2(4.2)=\SI{8.4}{V}.
+\end{equation}
+La tensión mínima de descarga admisible depende de las celdas, de su sistema de protección y de las recomendaciones del fabricante; no se fija aquí un umbral de corte sin conocer la referencia exacta. La capacidad en amperios-hora de una conexión 2S es igual a la capacidad de una celda, no el doble:
+\begin{equation}
+C_{\mathrm{pack}}=C_{\mathrm{celda}}.
+\end{equation}
+La capacidad de las celdas usadas no se ha verificado, por lo que no es válido afirmar que el paquete tenga \SI{6}{Ah} ni asignarle una energía exacta. Si la capacidad comprobada de cada celda fuese \(C_{\mathrm{celda}}\) Ah, la energía nominal sería:
+\begin{equation}
+E_{\mathrm{nom}}=\SI{7.4}{V}\,C_{\mathrm{celda}}\ \si{Wh}.
+\end{equation}
+
+\subsection{Distribución de potencia}
+El positivo del paquete alimenta la entrada del convertidor LM2596 y, en el montaje descrito, también el bus de potencia de los controladores TB6612FNG. El LM2596 se ajusta a \SI{5}{V} para la electrónica de control. El Arduino UNO y la Nicla Vision reciben alimentación desde la rama regulada, de acuerdo con sus entradas de alimentación compatibles. Los controladores TB6612FNG conmutan la corriente de los motores; su terminal VM pertenece al bus de potencia de motores, mientras que VCC corresponde a la lógica del controlador según el módulo utilizado. Todas las ramas deben compartir una referencia GND común.
+
+La distribución funcional se resume en la Fig.~\ref{fig:power}. Es un diagrama lógico del montaje y no sustituye la comprobación física de cada conexión.
+
+\begin{figure}[!t]
+\centering
+\fbox{\begin{minipage}{0.94\columnwidth}
+\centering
+\textbf{Paquete 2S: 7.4 V nominal, 8.4 V máximo}\\[2mm]
+\(\downarrow\)\\
+\begin{tabular}{c}
+Bus positivo de batería\\
+\(\swarrow\qquad\searrow\)\\[1mm]
+TB6612FNG: VM \qquad LM2596: IN+\\
+\(\downarrow\) \qquad \(\downarrow\)\\
+Seis motores TT \qquad Salida regulada a 5 V\\
+\hspace{34mm}\(\downarrow\)\\
+\hspace{17mm}Nicla Vision y Arduino UNO
+\end{tabular}\\[2mm]
+\textbf{GND común entre batería, convertidor, controladores y placas}
+\end{minipage}}
+\caption{Distribución funcional de alimentación de OSMIOR. La separación física de recorridos de alta corriente y control es una recomendación de cableado, no una segunda fuente regulada ya instalada.}
+\label{fig:power}
+\end{figure}
+
+En la versión actual se utiliza un convertidor LM2596 identificado como módulo reductor clásico. No debe describirse la arquitectura como dos convertidores buck independientes: la separación de ramas se realiza en el cableado, mientras que la rama lógica se regula con el LM2596. La capacidad real de corriente del módulo depende de su diseño, disipación térmica, ajuste y refrigeración; por ello no se presupone que entregue de forma continua una corriente específica sin una prueba bajo carga.
+
+\subsection{Etapa de tracción y control}
+El rover dispone de seis motorreductores TT. Los motores se accionan mediante controladores TB6612FNG; cada canal de puente H controla un motor, de modo que para controlar seis motores individualmente se requieren tres controladores de doble canal o una distribución equivalente. La cantidad y el cableado final de módulos deben verificarse físicamente antes de cerrar el esquema definitivo.
+
+El programa del Arduino UNO controla los motores y lee dos sensores ultrasónicos HC-SR04. La Nicla Vision ejecuta la visión artificial, procesa la información inercial integrada y se comunica con la interfaz HMI a través de su punto de acceso y servidor TCP. El módulo DFPlayer Mini aparece en el montaje y en el software del UNO, aunque su estado debe comprobarse debido a los problemas de funcionamiento reportados; por ello no se incluye una corriente fija de audio en el balance principal.
+
+\section{Modelo eléctrico y cálculos}
+\subsection{Corriente de los motores}
+Los valores de referencia compartidos para los motorreductores TT indican, aproximadamente, a \SI{6}{V}, una corriente sin carga de \SI{100}{mA} por motor y una corriente de bloqueo cercana a \SI{1}{A} por motor. Estos datos son nominales de referencia; la corriente real depende de la tensión aplicada, el estado mecánico, la carga, la temperatura y el ejemplar del motor.
+
+Para seis motores, la suma de corrientes sin carga estimada a esa condición de ensayo es:
+\begin{equation}
+I_{\mathrm{motores,sin\ carga}}\approx 6(0.1)=\SI{0.6}{A}.
+\end{equation}
+La suma aritmética de corrientes de bloqueo a la misma condición de referencia es:
+\begin{equation}
+I_{\mathrm{bloqueo,ref}}\approx 6(1.0)=\SI{6}{A}.
+\end{equation}
+Este último valor es un límite de referencia para una condición severa, no una corriente de operación continua esperada. Tampoco debe extrapolarse linealmente a \SI{8.4}{V}: la tensión del paquete varía entre carga completa y descarga y los datos del motor se han especificado aquí para \SI{6}{V}. La corriente de arranque puede aproximarse a la de bloqueo durante un intervalo breve, de manera que el cableado, la batería, las conexiones y los controladores deben soportar los transitorios sin que la tensión de la electrónica caiga por debajo de su límite operativo.
+
+La potencia eléctrica instantánea de la etapa de motores se expresa como:
+\begin{equation}
+P_{\mathrm{mot}}(t)=V_{\mathrm{mot}}(t)I_{\mathrm{mot}}(t).
+\end{equation}
+No se dispone de mediciones de corriente en el montaje, por lo que no se atribuye al rover una corriente real de marcha de \SI{3.31}{A} o \SI{6.01}{A}; esos valores del documento anterior no están sustentados por una medición confirmada.
+
+\subsection{Potencia de entrada y corriente de batería}
+Para una rama conectada directamente al paquete, la estimación de primera aproximación de corriente es:
+\begin{equation}
+I_{\mathrm{bat,mot}}\approx
+\frac{P_{\mathrm{mot}}}{V_{\mathrm{pack}}\eta_{\mathrm{mot}}},
+\end{equation}
+donde \(\eta_{\mathrm{mot}}\) representa conjuntamente, de forma aproximada, las pérdidas relevantes entre el paquete y la carga. Para el bus regulado de control:
+\begin{equation}
+I_{\mathrm{bat,ctrl}}\approx
+\frac{V_{\mathrm{ctrl}}I_{\mathrm{ctrl}}}
+{V_{\mathrm{pack}}\eta_{\mathrm{buck}}}.
+\end{equation}
+Por tanto, el balance general queda:
+\begin{equation}
+I_{\mathrm{bat}}\approx
+\frac{P_{\mathrm{mot}}}{V_{\mathrm{pack}}\eta_{\mathrm{mot}}}
++\frac{V_{\mathrm{ctrl}}I_{\mathrm{ctrl}}}
+{V_{\mathrm{pack}}\eta_{\mathrm{buck}}}.
+\label{eq:ibat}
+\end{equation}
+En esta ecuación, \(V_{\mathrm{ctrl}}=\SI{5}{V}\). La eficiencia del LM2596 y las corrientes reales de control no se han medido; por tanto, no se les asigna un porcentaje fijo como si fuera un dato experimental. La ecuación permite calcular el consumo de batería cuando se midan esas variables.
+
+\subsection{Autonomía estimada}
+Si la capacidad útil comprobada del paquete es \(C_{\mathrm{pack}}\) en Ah y la corriente promedio medida en la batería es \(I_{\mathrm{bat,avg}}\) en A, la autonomía ideal se estima mediante:
+\begin{equation}
+t_{\mathrm{ideal}}=\frac{C_{\mathrm{pack}}}{I_{\mathrm{bat,avg}}}.
+\label{eq:runtime}
+\end{equation}
+La autonomía real será menor debido a la capacidad efectiva de las celdas, la descarga a alta corriente, las pérdidas del convertidor, los transitorios de los motores, el umbral de corte y los ciclos de movimiento y espera. Como no se conoce con certeza la capacidad de las celdas y no se cuenta con un registro de corriente promedio, no es técnicamente correcto publicar una autonomía numérica única en esta versión. Se recomienda medir la corriente de batería durante un ciclo representativo de exploración y comprobar la capacidad útil de las celdas.
+
+\subsection{Caída de tensión y reinicios}
+La caída instantánea en la alimentación puede modelarse de manera simplificada como:
+\begin{equation}
+\Delta V\approx I_{\mathrm{transitorio}}R_{\mathrm{equiv}},
+\end{equation}
+donde \(R_{\mathrm{equiv}}\) reúne la resistencia interna de las celdas, cables, conectores, interruptor, pistas y contactos. Un aumento brusco de corriente al arrancar o bloquear motores puede reducir la tensión disponible para el LM2596 y las placas. El reinicio observado de la Nicla al accionar los motores es consistente con esta hipótesis, pero no la demuestra por sí solo. La validación debe hacerse midiendo simultáneamente la tensión del paquete, la salida de \SI{5}{V} y la entrada de alimentación de la Nicla durante los transitorios.
+
+Para reducir el acoplamiento entre tracción y control se recomienda: (i) llevar por separado los conductores de alta corriente de motores y los de alimentación lógica; (ii) reunir los retornos en un punto de baja impedancia cercano a la distribución de batería, evitando que la corriente de motor circule por el retorno de la Nicla; (iii) mantener cortos los cables de motores y añadir supresión/desacoplo apropiados de acuerdo con las hojas de datos; (iv) verificar con multímetro y osciloscopio la salida del LM2596 bajo carga; y (v) comprobar la polaridad, el estado de las celdas y la capacidad del interruptor y conectores. Estas medidas son recomendaciones de ingeniería y deben validarse experimentalmente en el rover.
+
+\section{Resumen de datos y límites del análisis}
+\begin{table}[!t]
+\caption{Componentes y datos eléctricos considerados}
+\label{tab:components}
+\centering
+\footnotesize
+\begin{tabular}{p{0.35\columnwidth} p{0.57\columnwidth}}
+\toprule
+\textbf{Elemento} & \textbf{Dato empleado / limitación}\\
+\midrule
+Batería & 2 celdas 18650 en serie; \SI{7.4}{V} nominal y \SI{8.4}{V} cargada; capacidad desconocida.\\
+Convertidor & LM2596 reductor ajustado a \SI{5}{V}; eficiencia y corriente continua disponibles sin medir.\\
+Control & Nicla Vision y Arduino UNO.\\
+Tracción & Seis motorreductores TT; valores de referencia a \SI{6}{V}: \SI{0.1}{A} sin carga y \SI{1}{A} de bloqueo por motor.\\
+Drivers & TB6612FNG; debe verificarse que el número de módulos y la corriente por canal sean adecuados para los seis motores.\\
+Sensores & Dos HC-SR04; IMU integrada de la Nicla Vision.\\
+Audio & DFPlayer Mini presente en el diseño, pero su estado y consumo deben verificarse antes de incluirlos en el balance.\\
+Instrumentación & Sin encoder ni sensor de corriente confirmado; no hay medición directa de velocidad de rueda, corriente o torque.\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Conclusiones}
+La versión implementada de OSMIOR utiliza un paquete 2S de celdas 18650, una rama de tracción alimentada desde el bus de batería y una rama de control regulada a \SI{5}{V} mediante un LM2596. La estimación energética debe distinguir entre datos nominales de hojas de datos, valores calculados y mediciones reales. Con la información disponible puede calcularse una corriente de referencia de \SI{0.6}{A} para seis motores sin carga y una suma de bloqueo de referencia de \SI{6}{A} a la condición especificada de \SI{6}{V}; estos valores no representan el consumo normal medido del rover.
+
+No se asigna una autonomía numérica porque la capacidad real de las celdas y la corriente promedio del sistema no están verificadas. La prioridad de validación es registrar la tensión de la rama de \SI{5}{V} durante el arranque de los motores, medir la corriente del paquete en un ciclo de trabajo representativo y confirmar la capacidad de los controladores y del convertidor. La separación física de los conductores de potencia y lógica, junto con una distribución de tierra de baja impedancia, puede ayudar a reducir los reinicios observados, pero su eficacia debe comprobarse mediante mediciones.
+
+\end{document}
