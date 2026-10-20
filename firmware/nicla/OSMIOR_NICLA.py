@@ -1,4 +1,4 @@
-# OSMIOR V3 - NICLA Vision / OpenMV 5.x
+# OSMIOR V4 - NICLA Vision / OpenMV 5.x
 # ============================================================
 # Arquitectura:
 #   HMI <-> WiFi/TCP <-> NICLA <-> UART4 <-> UNO
@@ -53,6 +53,10 @@ GC_PERIOD_MS = 1000
 
 CAMERA_STREAM = False
 CAMERA_FRAMESIZE = csi.QQVGA       # 160x120
+# Si la imagen sale de cabeza/espejo segun como montaste la Nicla, el modelo
+# NO reconoce personas. Ajusta estos dos y mira FMEAN/PRAW en la HMI.
+CAMERA_VFLIP = False
+CAMERA_HMIRROR = False
 PERSON_THRESHOLD = 0.60
 PERSON_ON_COUNT = 2
 PERSON_OFF_COUNT = 2
@@ -61,6 +65,10 @@ person_model = None
 person_model_ok = False
 person_model_path = "NONE"
 person_score = 0.0
+person_raw = "--"           # probabilidades que ve el modelo (diagnostico)
+person_idx = -1             # indice de clase usado como 'persona'
+frame_mean = 0.0            # brillo medio del cuadro (0-255)
+vision_ms = 0               # tiempo de inferencia
 person_detected = False
 person_on_counter = 0
 person_off_counter = 0
@@ -144,11 +152,30 @@ last_uno_ack = "NONE"
 UART_POLL_PERIOD_MS = 500
 UART_BUSY_MOTION_MS = 12
 UART_BUSY_AUDIO_MS = 18
-UART_BUSY_POLL_MS = 55
+UART_BUSY_POLL_MS = 60          # T line is ~42 bytes @9600 = ~44 ms
+UART_BUSY_RADAR_MS = 45         # R line is <=36 bytes
+UART_BUSY_MISC_MS = 12
+RADAR_POLL_PERIOD_MS = 120
 UART_BUSY_GUARD_MS = 2
 uart_busy_until_ms = 0
 last_uart_poll_ms = 0
 pending_motion = None          # (command, HMI sequence)
+pending_misc = []              # [(bytes, kind, code, seq), ...] collection / radar
+last_radar_poll_ms = 0
+radar_requested = False        # what the HMI asked for
+radar_sent_ms = 0
+collection_command = "O"       # what the HMI asked for (C / E / O)
+ack_retries = {"M": 0, "C": 0, "Z": 0}
+MAX_ACK_RETRIES = 3
+uno_col = "O"
+uno_radar = 0
+uno_t_ext = -99.9
+uno_hum = -1.0
+uno_t_cab = -99.9
+uno_press = -1.0
+uno_envst = 0
+last_t_ms = 0
+last_env_print_ms = 0
 pending_audio = []             # [(track, HMI sequence), ...]
 pending_uart_acks = []         # [(type, code, seq, sent_ticks), ...]
 uart_rx_bad_bytes = 0
@@ -179,6 +206,7 @@ last_audio = {
     3: -100000,
     4: -100000,
     5: -100000,
+    6: -100000,
 }
 AUDIO_COOLDOWN_MS = 5000
 PERSON_AUDIO_COOLDOWN_MS = 8000
@@ -277,6 +305,11 @@ def init_camera_and_model():
     camera.reset()
     camera.pixformat(csi.GRAYSCALE)
     camera.framesize(CAMERA_FRAMESIZE)
+    try:
+        camera.vflip(CAMERA_VFLIP)
+        camera.hmirror(CAMERA_HMIRROR)
+    except Exception as exc:
+        print("CAMERA FLIP ERROR:", repr(exc))
     camera.snapshot(time=1200)
 
     gc.collect()
@@ -312,8 +345,53 @@ def init_camera_and_model():
         mem_report("model_error")
 
 
+def _is_negative_label(lab):
+    for bad in ("no_", "no ", "not", "non", "background", "unsure", "none"):
+        if lab.startswith(bad) or ("_" + bad) in lab:
+            return True
+    return False
+
+
+def resolve_person_index(n):
+    """Indice de la clase 'persona'.
+
+    BUG V3: se buscaba el substring "person" y 'no_person' tambien lo contiene.
+    Con labels ['no_person','person'] se usaba la clase equivocada y el
+    resultado salia INVERTIDO. Ahora: coincidencia exacta primero, y se
+    descartan las etiquetas negativas.
+    """
+    labels = getattr(person_model, "labels", None)
+    if labels:
+        m = min(len(labels), n)
+        for i in range(m):
+            if str(labels[i]).strip().lower() in ("person", "people", "human"):
+                return i
+        for i in range(m):
+            lab = str(labels[i]).strip().lower()
+            if "person" in lab and not _is_negative_label(lab):
+                return i
+    return 1 if n >= 2 else 0
+
+
+def to_probabilities(vals):
+    """Asegura probabilidades 0..1 sin importar si el modelo entrega
+    probabilidades, logits o enteros cuantizados."""
+    total = 0.0
+    inside = True
+    for v in vals:
+        total += v
+        if v < 0.0 or v > 1.0:
+            inside = False
+    if inside and abs(total - 1.0) < 0.15:
+        return vals
+    top = max(vals)
+    exps = [math.exp(max(-30.0, min(30.0, v - top))) for v in vals]
+    den = sum(exps)
+    return [e / den for e in exps]
+
+
 def detect_person_once():
-    global person_score
+    global person_score, person_raw, person_idx, frame_mean, vision_ms
 
     if not person_model_ok or person_model is None or camera is None:
         person_score = 0.0
@@ -323,41 +401,34 @@ def detect_person_once():
 
     try:
         img = camera.snapshot()
-        outputs = person_model.predict([img])
 
-        # Google/TFLite Micro person_detect model: [no_person, person].
-        raw = outputs[0]
-        flat = raw.flatten()
+        try:
+            frame_mean = float(img.get_statistics().mean())
+        except Exception:
+            frame_mean = -1.0
+
+        outputs = person_model.predict([img])
+        flat = outputs[0].flatten()
         n = len(flat)
 
         if n >= 2:
-            score_no_person = safe_float(flat[0], 0.0)
-            score_person = safe_float(flat[1], 0.0)
-
-            # If labels are available and explicitly identify person,
-            # use that index instead of assuming index 1.
-            labels = getattr(person_model, "labels", None)
-            if labels:
-                for idx in range(min(len(labels), n)):
-                    label = str(labels[idx]).lower()
-                    if "person" in label or "dude" in label:
-                        score_person = safe_float(flat[idx], score_person)
-                        break
-
-            person_score = score_person
-            detected = score_person >= PERSON_THRESHOLD
-
+            vals = [safe_float(flat[i], 0.0) for i in range(n)]
+            probs = to_probabilities(vals)
+            person_idx = resolve_person_index(n)
+            person_score = probs[person_idx]
+            person_raw = "/".join(["{:.2f}".format(p) for p in probs])
         elif n == 1:
+            person_idx = 0
             person_score = safe_float(flat[0], 0.0)
-            detected = person_score >= PERSON_THRESHOLD
-
+            person_raw = "{:.2f}".format(person_score)
         else:
             person_score = 0.0
-            detected = False
+            person_raw = "--"
 
-        dt = max(1, elapsed(t0))
-        print("VISION", "score=", round(person_score, 3), "fps=", round(1000.0 / dt, 1))
-        return detected
+        vision_ms = max(1, elapsed(t0))
+        print("VISION p=", round(person_score, 3), "raw=", person_raw,
+              "idx=", person_idx, "mean=", round(frame_mean, 1), "ms=", vision_ms)
+        return person_score >= PERSON_THRESHOLD
 
     except Exception as exc:
         print("VISION ERROR:", repr(exc))
@@ -564,8 +635,38 @@ def enqueue_motion(cmd, seq=0):
     return True
 
 
+def enqueue_misc(payload, kind, code, seq=0):
+    """Collection (C/E/O) and radar (Z0/Z1) commands. Same kind -> last wins."""
+    for i in range(len(pending_misc) - 1, -1, -1):
+        if pending_misc[i][1] == kind:
+            pending_misc.pop(i)
+    pending_misc.append((payload, kind, str(code), int(seq or 0)))
+    return True
+
+
+def set_collection(cmd, seq=0):
+    global collection_command
+    cmd = str(cmd).upper()
+    if cmd not in ("C", "E", "O"):
+        return False
+    collection_command = cmd
+    return enqueue_misc(cmd.encode("ascii"), "C", cmd, seq)
+
+
+def set_radar(on, seq=0):
+    global radar_requested, radar_sent_ms
+    if on == radar_requested:
+        return True
+    radar_requested = on
+    radar_sent_ms = now_ms()
+    if on:
+        # Audio 006 (inspeccion de la zona) suena al activar el radar.
+        play_audio(6, 0, force=True)
+    return enqueue_misc(b"Z1" if on else b"Z0", "Z", "1" if on else "0", seq)
+
+
 def enqueue_audio(track, seq=0):
-    if track < 1 or track > 5:
+    if track < 1 or track > 6:
         return False
     if len(pending_audio) >= 5:
         pending_audio.pop(0)
@@ -635,6 +736,8 @@ def parse_uno_line(line):
     global uno_dl, uno_dr, uno_df_ok, uno_pwm
     global uno_state, last_uno_ack, uart_busy_until_ms
     global uno_rx_bad_bytes, uno_sw_overflows, uno_line_overflows
+    global uno_col, uno_radar, uno_t_ext, uno_hum, uno_t_cab, uno_press
+    global radar_sent_ms, uno_envst, last_t_ms, last_env_print_ms
 
     line = line.strip()
     if not line:
@@ -643,16 +746,43 @@ def parse_uno_line(line):
     now = now_ms()
 
     if line.startswith("T,"):
-        # Compact response: T,DL_cm,DR_cm,DF,STATE,RX_BAD,OVF,LINE_BAD
+        # T,DL,DR,DF,MOV,COL,RXBAD,OVF,LINE,TEXT10,HUM,TCAB10,PRES10,RAD
         parts = line.split(",")
-        if len(parts) >= 8:
+        if len(parts) >= 14:
             uno_dl = safe_float(parts[1], -1.0)
             uno_dr = safe_float(parts[2], -1.0)
             uno_df_ok = safe_int(parts[3], 0)
             uno_state = parts[4]
-            uno_rx_bad_bytes = safe_int(parts[5], 0)
-            uno_sw_overflows = safe_int(parts[6], 0)
-            uno_line_overflows = safe_int(parts[7], 0)
+            uno_col = parts[5]
+            uno_rx_bad_bytes = safe_int(parts[6], 0)
+            uno_sw_overflows = safe_int(parts[7], 0)
+            uno_line_overflows = safe_int(parts[8], 0)
+            te = safe_int(parts[9], -999)
+            uno_t_ext = te / 10.0 if te > -900 else -99.9
+            uno_hum = safe_float(parts[10], -1.0)
+            tc = safe_int(parts[11], -999)
+            uno_t_cab = tc / 10.0 if tc > -900 else -99.9
+            pr = safe_int(parts[12], -1)
+            uno_press = pr / 10.0 if pr > 0 else -1.0
+            uno_radar = safe_int(parts[13], 0)
+            uno_envst = safe_int(parts[14], 0) if len(parts) >= 15 else 0
+            last_t_ms = now
+            if elapsed(last_env_print_ms, now) > 2000:
+                last_env_print_ms = now
+                print("UNO ENV text=", uno_t_ext, "hum=", uno_hum, "tcab=", uno_t_cab,
+                      "press=", uno_press, "envst=", uno_envst)
+            # UNO rebooted / dropped the radar: re-assert what the HMI asked for.
+            if (radar_requested and uno_radar == 0 and
+                    elapsed(radar_sent_ms) > 1500):
+                radar_sent_ms = now_ms()
+                enqueue_misc(b"Z1", "Z", "1", 0)
+        uart_busy_until_ms = time.ticks_add(now, UART_BUSY_GUARD_MS)
+        return
+
+    if line == "R" or line.startswith("R,"):
+        # R,ang:cm,ang:cm,...  -> forward to the HMI untouched
+        if len(line) > 1:
+            send_hmi("RAD;PTS=" + line[2:])
         uart_busy_until_ms = time.ticks_add(now, UART_BUSY_GUARD_MS)
         return
 
@@ -669,6 +799,8 @@ def parse_uno_line(line):
                     matched = pending_uart_acks.pop(i)
                     break
 
+            if kind in ack_retries:
+                ack_retries[kind] = 0
             if matched is not None:
                 _kind, _code, seq, sent_ms = matched
                 uart_ms = elapsed(sent_ms, now)
@@ -729,20 +861,47 @@ def read_uno_uart():
         print("UART RX ERROR", repr(exc))
 
 
+def _is_latest_intent(kind, code):
+    if kind == "M":
+        return code == motion_command
+    if kind == "C":
+        return code == collection_command
+    if kind == "Z":
+        return code == ("1" if radar_requested else "0")
+    return False
+
+
 def expire_uart_acks(now):
-    # A lost/corrupt ACK must not block telemetry polling or future commands forever.
+    # A lost/corrupt byte must not leave the rover moving: if the ACK of the
+    # LATEST motion / collection / radar intent never arrives, resend it
+    # (bounded). Audio is not retried.
+    global pending_motion
     for i in range(len(pending_uart_acks) - 1, -1, -1):
         record = pending_uart_acks[i]
         if elapsed(record[3], now) > 300:
             pending_uart_acks.pop(i)
             kind, code, seq, sent_ms = record
             print("UART ACK TIMEOUT", kind, code, "seq=", seq)
-            send_hmi("EVT;ACK_TIMEOUT;TYPE={};CMD={};SEQ={}".format(kind, code, seq))
+
+            if (kind in ack_retries and _is_latest_intent(kind, code) and
+                    ack_retries[kind] < MAX_ACK_RETRIES):
+                ack_retries[kind] += 1
+                if kind == "M":
+                    if pending_motion is None:
+                        pending_motion = (code, seq)
+                elif kind == "C":
+                    enqueue_misc(code.encode("ascii"), "C", code, seq)
+                else:
+                    enqueue_misc(b"Z" + code.encode("ascii"), "Z", code, seq)
+                send_hmi("EVT;ACK_RETRY;TYPE={};CMD={};SEQ={}".format(kind, code, seq))
+            else:
+                send_hmi("EVT;ACK_TIMEOUT;TYPE={};CMD={};SEQ={}".format(kind, code, seq))
 
 
 def flush_uno_actions(now):
     """Send one short transaction at a time to avoid UNO SoftwareSerial TX/RX overlap."""
     global pending_motion, last_uart_poll_ms, uart_busy_until_ms
+    global last_radar_poll_ms
 
     if time.ticks_diff(now, uart_busy_until_ms) < 0:
         return
@@ -760,6 +919,18 @@ def flush_uno_actions(now):
             print("UART TX ERROR motion", repr(exc))
         return
 
+    if pending_misc:
+        payload, kind, code, seq = pending_misc.pop(0)
+        sent_ms = now_ms()
+        try:
+            uart.write(payload)
+            queue_uart_ack(kind, code, seq, sent_ms)
+            uart_busy_until_ms = time.ticks_add(sent_ms, UART_BUSY_MISC_MS)
+            print("UART TX", kind, code, "seq=", seq)
+        except Exception as exc:
+            print("UART TX ERROR misc", repr(exc))
+        return
+
     if pending_audio:
         track, seq = pending_audio.pop(0)
         sent_ms = now_ms()
@@ -770,6 +941,18 @@ def flush_uno_actions(now):
             print("UART TX audio", track, "seq=", seq)
         except Exception as exc:
             print("UART TX ERROR audio", repr(exc))
+        return
+
+    # Radar points: only while the radar is on, between telemetry polls.
+    if (radar_requested and not pending_uart_acks and
+            elapsed(last_radar_poll_ms, now) >= RADAR_POLL_PERIOD_MS and
+            elapsed(last_uart_poll_ms, now) < UART_POLL_PERIOD_MS):
+        try:
+            uart.write(b"P")
+            last_radar_poll_ms = now
+            uart_busy_until_ms = time.ticks_add(now, UART_BUSY_RADAR_MS)
+        except Exception as exc:
+            print("UART TX ERROR radar poll", repr(exc))
         return
 
     # Poll only when no command is queued and no ACK is outstanding.
@@ -804,8 +987,10 @@ def send_hmi(line):
 def close_client():
     global client, client_addr, hmi_rx_buffer
 
-    # Safety first: network loss -> stop rover.
+    # Safety first: network loss -> stop rover, stop collection, radar off.
     enqueue_motion("S", 0)
+    set_collection("O", 0)
+    set_radar(False, 0)
 
     if client is not None:
         try:
@@ -881,12 +1066,25 @@ def handle_hmi_line(line):
         parts = upper.split(",")
         track = safe_int(parts[1], 0) if len(parts) >= 2 else 0
         seq = safe_int(parts[2], 0) if len(parts) >= 3 else 0
-        if 1 <= track <= 5:
+        if 1 <= track <= 6:
             # Track 3 is the explicit HMI query; play immediately when requested.
             if track == 3:
                 play_audio(3, seq, force=True)
             else:
                 play_audio(track, seq)
+        return
+
+    if upper.startswith("COL,"):
+        parts = upper.split(",")
+        if len(parts) >= 2 and parts[1]:
+            seq = safe_int(parts[2], 0) if len(parts) >= 3 else 0
+            set_collection(parts[1][0], seq)
+        return
+
+    if upper.startswith("RAD,"):
+        parts = upper.split(",")
+        seq = safe_int(parts[2], 0) if len(parts) >= 3 else 0
+        set_radar(len(parts) >= 2 and parts[1][:1] == "1", seq)
         return
 
     if upper in ("F", "B", "L", "R", "S"):
@@ -989,6 +1187,19 @@ def build_telemetry():
         "UOVF={};"
         "NURXBAD={};"
         "ULINE={};"
+        "TEXT={:.1f};"
+        "HUM={:.0f};"
+        "TCAB={:.1f};"
+        "PRESS={:.1f};"
+        "CO2=-1;"
+        "COL={};"
+        "RADAR={};"
+        "PRAW={};"
+        "PIDX={};"
+        "FMEAN={:.1f};"
+        "VMS={};"
+        "ENVST={};"
+        "TAGE={};"
         "MODE=MANUAL"
     ).format(
         ax_g, ay_g, az_g,
@@ -1018,6 +1229,18 @@ def build_telemetry():
         uno_sw_overflows,
         uno_rx_bad_bytes,
         uno_line_overflows,
+        uno_t_ext,
+        uno_hum,
+        uno_t_cab,
+        uno_press,
+        uno_col,
+        uno_radar,
+        person_raw,
+        person_idx,
+        frame_mean,
+        vision_ms,
+        uno_envst,
+        (elapsed(last_t_ms) if last_t_ms else 99999),
     )
 
 
@@ -1059,7 +1282,7 @@ def init_system():
     last_hmi_rx_ms = now_ms()
 
     print("============================================")
-    print("OSMIOR NICLA V3 GATEWAY")
+    print("OSMIOR NICLA V4 GATEWAY")
     print("IP:", ap.ifconfig()[0])
     print("TCP:", TCP_PORT)
     print("UART4: SDA=TX / SCL=RX")
@@ -1069,8 +1292,9 @@ def init_system():
     print("V THEORY:", THEORETICAL_SPEED_MPS)
     print("============================================")
 
-    # Start UNO stopped.
+    # Start UNO stopped, collection off, radar off.
     enqueue_motion("S", 0)
+    set_collection("O", 0)
 
 
 # ------------------------------------------------------------
