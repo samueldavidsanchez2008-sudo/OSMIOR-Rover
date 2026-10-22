@@ -10,69 +10,55 @@
 #include <math.h>
 
 // ============================================================
-// OSMIOR V4 - UNO
+// OSMIOR V5 - UNO
+// Distribucion segun el cableado real verificado.
+// Driver 1 = traccion izquierda; Driver 2 = traccion derecha.
+// En CADA driver se comparten las entradas logicas de los dos canales:
+//   PWMA + PWMB unidos; AIN1 + BIN1 unidos; AIN2 + BIN2 unidos.
+// Driver 1: PWM comun D3, IN1 comun D4, IN2 comun D5.
+// Driver 2: PWM comun D6, IN1 comun D7, IN2 comun D8.
+// STBY de ambos drivers a D9.
+//   D2      DHT11 DATA
+//   D3      PWM traccion izquierda (PWMA+PWMB Driver 1)
+//   D4/D5   IN1/IN2 izquierda (AIN1+BIN1 / AIN2+BIN2 Driver 1)
+//   D6      PWM traccion derecha (PWMA+PWMB Driver 2)
+//   D7/D8   IN1/IN2 derecha (AIN1+BIN1 / AIN2+BIN2 Driver 2)
+//   D9      STBY compartido de ambos TB6612FNG
+//   D10/D11 UART por SoftwareSerial: RX / TX del UNO hacia Nicla
+//   D12     TX SoftwareSerial hacia RX del DFPlayer (resistencia ~1 kOhm)
+//   D13     RX dummy del SoftwareSerial del DFPlayer; sin cable externo
+//   A0      señal del servo radar
+//   A1/A2   HC-SR04 izquierdo/derecho con NewPing (TRIG+ECHO en un pin)
+//   A3      HC-SR04 superior del radar con NewPing (TRIG+ECHO en un pin)
+//   A4/A5   BMP280 SDA/SCL (direccion 0x76)
 //
-// PINOUT (16 pines utiles, todos usados):
-//   D0/D1  USB (no usar)
-//   D2     DHT11 DATA (temp/humedad EXTERNA)
-//   D3     PWM tracción: PWMA del driver 1 + PWMA y PWMB del driver 2 (los 3 unidos)
-//   D4/D5  Driver 1 canal A = lado IZQ (3 motores): AIN1 / AIN2
-//   D6     PWM recolección: driver 1 canal B (PWMB)
-//   D7/D8  Driver 2 = lado DER (2 motores en canal A + 1 en canal B):
-//          AIN1 y BIN1 unidos a D7; AIN2 y BIN2 unidos a D8
-//   D9     Recolección IN1: driver 1 canal B (BIN1)
-//   D10    NICLA -> UNO (RX SoftwareSerial)
-//   D11    UNO -> NICLA (TX SoftwareSerial)
-//   D12    UNO -> DFPlayer RX (via 1k). TX del DFPlayer NO se conecta.
-//   D13    Recolección IN2: driver 1 canal B (BIN2)
-//   A0     Servo radar (señal)
-//   A1     HC-SR04 izquierdo  (TRIG+ECHO unidos, ECHO con 1k en serie)
-//   A2     HC-SR04 derecho    (idem)
-//   A3     HC-SR04 radar      (idem)
-//   A4/A5  I2C: SDA/SCL del BMP280 (dirección 0x76)
-//   STBY de AMBOS drivers -> 5 V fijo (no usa pin)
-//
-// PROTOCOLO NICLA -> UNO (bytes ASCII):
-//   F B L R S      movimiento (1 byte, ejecuta al instante)
-//   C E O          recolección: C=adelante, E=reversa, O=off
-//   A1..A6         audio (2 bytes)
-//   Z1 / Z0        radar on / off (2 bytes)
-//   ?              pide telemetría
-//   P              pide puntos de radar (solo con radar activo)
-// UNO -> NICLA:
-//   K,M,F  K,C,C  K,A,5  K,Z,1      ACK
-//   T,DL,DR,DF,MOV,COL,RXBAD,OVF,LINE,TEXT10,HUM,TCAB10,PRES10,RAD,ENVST
-//   R,ang:cm,ang:cm,...             (hasta 4 puntos por respuesta)
-//
-// SEGURIDAD: si no llega NINGÚN byte de la NICLA en 1.5 s y hay un
-// actuador encendido, se apagan motores y recolección (la NICLA hace
-// poll cada 0.5 s, así que ese poll es el "latido").
+// Importante: las entradas de ambos puentes H en cada driver reciben la misma
+// señal, pero NO se deben unir entre si las salidas de potencia A y B.
+// NICLA -> UNO: F B L R S, A1..A6, Z1/Z0, ?, P
+// UNO -> NICLA: ACK, telemetria T y puntos radar R. Sin recolector.
 // ============================================================
 
 #define USE_WDT 1          // pon 0 si tu UNO es clon con bootloader viejo
 
 // ---------------- pines ----------------
 const uint8_t PIN_DHT      = 2;
-const uint8_t PWM_TRAC     = 3;   // PWMA(drv1) + PWMA y PWMB(drv2), juntos
+const uint8_t PWM_L        = 3;
+const uint8_t PWM_R        = 6;
 const uint8_t IN1_L        = 4;
 const uint8_t IN2_L        = 5;
-const uint8_t PWM_COL      = 6;
-const uint8_t IN1_R        = 7;   // drv2: AIN1 + BIN1 unidos
-const uint8_t IN2_R        = 8;   // drv2: AIN2 + BIN2 unidos
-const uint8_t IN1_COL      = 9;
-const uint8_t IN2_COL      = 13;
+const uint8_t IN1_R        = 7;
+const uint8_t IN2_R        = 8;
+const uint8_t PIN_STBY     = 9;
 const uint8_t PIN_SERVO    = A0;
 const uint8_t PIN_US_L     = A1;
 const uint8_t PIN_US_R     = A2;
 const uint8_t PIN_US_RADAR = A3;
+const uint8_t VELOCIDAD    = 180;
 
-const uint8_t VELOCIDAD     = 220;   // tracción (igual que V3)
-const uint8_t VELOCIDAD_COL = 200;   // recolección: ajustar con el motor real
-
-// ---------------- UART / DFPlayer ----------------
-// El 2º objeto usa como RX "dummy" el mismo D10: nunca escucha, solo transmite.
+// UNO recibe de Nicla por D10 y transmite a Nicla por D11.
+// DFPlayer es de solo envio: UNO D12 -> RX del DFPlayer; TX del DFPlayer sin conectar.
 SoftwareSerial niclaSerial(10, 11);     // RX, TX
-SoftwareSerial dfPlayerSerial(10, 12);  // RX dummy (= D10), TX real D12
+SoftwareSerial dfPlayerSerial(13, 12);  // RX dummy, TX real D12
 DFRobotDFPlayerMini dfPlayer;
 bool dfPlayerOK = false;
 
@@ -124,7 +110,6 @@ const unsigned long ENV_STALE_MS = 15000UL; // sin lecturas nuevas => dato inval
 
 // ---------------- estado ----------------
 char currentMotion = 'S';
-char currentCol = 'O';
 int16_t distL = -1, distR = -1;
 char prefixByte = 0;
 unsigned long lastSonarMs = 0, lastPingEndMs = 0, lastRxMs = 0, lastLinkMs = 0;
@@ -138,7 +123,6 @@ const unsigned long RADAR_LINK_TIMEOUT_MS = 4000UL;
 // ---------------- prototipos ----------------
 void processNiclaByte(uint8_t raw);
 void processMotion(char cmd);
-void processCollect(char cmd);
 void setRadar(bool on);
 void reproducirAudio(uint8_t track);
 void sendNicla(const char *line);
@@ -146,23 +130,23 @@ void sendAck(char kind, char code);
 void sendTelemetry();
 void sendRadar();
 void adelante(); void atras(); void izquierda(); void derecha(); void detener();
-void colAdelante(); void colReversa(); void colOff();
 
 // ============================================================
 void setup() {
   Serial.begin(115200);
 
-  pinMode(PWM_TRAC, OUTPUT); pinMode(IN1_L, OUTPUT); pinMode(IN2_L, OUTPUT);
-  pinMode(IN1_R, OUTPUT);    pinMode(IN2_R, OUTPUT);
-  pinMode(PWM_COL, OUTPUT);  pinMode(IN1_COL, OUTPUT); pinMode(IN2_COL, OUTPUT);
+  pinMode(PWM_L, OUTPUT); pinMode(PWM_R, OUTPUT);
+  pinMode(IN1_L, OUTPUT); pinMode(IN2_L, OUTPUT);
+  pinMode(IN1_R, OUTPUT); pinMode(IN2_R, OUTPUT);
+  pinMode(PIN_STBY, OUTPUT);
+  digitalWrite(PIN_STBY, HIGH);
   detener();
-  colOff();
 
   niclaSerial.begin(9600);
   dfPlayerSerial.begin(9600);   // begin() deja a este objeto escuchando...
   niclaSerial.listen();         // ...así que devolvemos la escucha a la NICLA
 
-  Serial.println(F("OSMIOR UNO V4"));
+  Serial.println(F("OSMIOR UNO V5 - PINOUT DRIVER1 D3-D5, DRIVER2 D6-D8, STBY D9"));
 
   // I2C con timeout para que un BMP280 desconectado no cuelgue el loop.
   Wire.begin();
@@ -175,20 +159,20 @@ void setup() {
   pinMode(PIN_DHT, OUTPUT);
   digitalWrite(PIN_DHT, HIGH);
 
-  // El DFPlayer tarda ~1.5 s en arrancar tras alimentarse.
+  // El DFPlayer tarda ~1.5 s en arrancar. No sonar al encender:
+  // la pista 1 se solicita al recibir MISSION,START desde la HMI.
   while (millis() < 1800UL) { }
-  dfPlayer.begin(dfPlayerSerial, false, false);  // sin ACK, sin reset (no hay línea de retorno)
-  dfPlayerOK = true;  // OJO: no se puede verificar la SD sin conectar su TX
+  dfPlayer.begin(dfPlayerSerial, false, false);  // sin retorno TX conectado
+  dfPlayerOK = true;  // no se verifica la SD sin el retorno del reproductor
   dfPlayer.volume(25);
-  delay(200);
-  dfPlayer.play(1);
+  dfPlayer.stop();               // evita continuar una pista previa al encender
   niclaSerial.listen();
 
   lastLinkMs = millis();
 #if USE_WDT
   wdt_enable(WDTO_2S);
 #endif
-  sendNicla("READY,UNO,4");
+  sendNicla("READY,UNO,5");
 }
 
 // ============================================================
@@ -209,7 +193,6 @@ void readUsbSerial() {
         const char u = (char)toupper(usbBuffer[0]);
         lastLinkMs = millis();   // por USB cada comando dura 1.5 s (deadman)
         if (u == 'F' || u == 'B' || u == 'L' || u == 'R' || u == 'S') processMotion(u);
-        else if (u == 'C' || u == 'E' || u == 'O') processCollect(u);
       }
       usbIndex = 0;
       continue;
@@ -237,7 +220,6 @@ void processNiclaByte(uint8_t raw) {
 
   switch (c) {
     case 'F': case 'B': case 'L': case 'R': case 'S': processMotion(c); break;
-    case 'C': case 'E': case 'O': processCollect(c); break;
     case '?': sendTelemetry(); break;
     case 'P': sendRadar(); break;
     case 'A': case 'Z': prefixByte = c; break;
@@ -257,45 +239,32 @@ void processMotion(char cmd) {
   sendAck('M', cmd);
 }
 
-void processCollect(char cmd) {
-  if (cmd == 'C') colAdelante();
-  else if (cmd == 'E') colReversa();
-  else { colOff(); cmd = 'O'; }
-  currentCol = cmd;
-  sendAck('C', cmd);
-}
-
-// ---------------- motores tracción (lógica V3 intacta) ----------------
+// ---------------- motores de traccion: distribucion original ----------------
 void adelante() {
   digitalWrite(IN1_L, HIGH); digitalWrite(IN2_L, LOW);
   digitalWrite(IN1_R, HIGH); digitalWrite(IN2_R, LOW);
-  analogWrite(PWM_TRAC, VELOCIDAD);
+  analogWrite(PWM_L, VELOCIDAD); analogWrite(PWM_R, VELOCIDAD);
 }
 void atras() {
   digitalWrite(IN1_L, LOW); digitalWrite(IN2_L, HIGH);
   digitalWrite(IN1_R, LOW); digitalWrite(IN2_R, HIGH);
-  analogWrite(PWM_TRAC, VELOCIDAD);
+  analogWrite(PWM_L, VELOCIDAD); analogWrite(PWM_R, VELOCIDAD);
 }
 void izquierda() {
   digitalWrite(IN1_L, LOW); digitalWrite(IN2_L, HIGH);
   digitalWrite(IN1_R, HIGH); digitalWrite(IN2_R, LOW);
-  analogWrite(PWM_TRAC, VELOCIDAD);
+  analogWrite(PWM_L, VELOCIDAD); analogWrite(PWM_R, VELOCIDAD);
 }
 void derecha() {
   digitalWrite(IN1_L, HIGH); digitalWrite(IN2_L, LOW);
   digitalWrite(IN1_R, LOW); digitalWrite(IN2_R, HIGH);
-  analogWrite(PWM_TRAC, VELOCIDAD);
+  analogWrite(PWM_L, VELOCIDAD); analogWrite(PWM_R, VELOCIDAD);
 }
 void detener() {
   digitalWrite(IN1_L, LOW); digitalWrite(IN2_L, LOW);
   digitalWrite(IN1_R, LOW); digitalWrite(IN2_R, LOW);
-  analogWrite(PWM_TRAC, 0);
+  analogWrite(PWM_L, 0); analogWrite(PWM_R, 0);
 }
-
-// ---------------- recolección (driver 1, canal B) ----------------
-void colAdelante() { digitalWrite(IN1_COL, HIGH); digitalWrite(IN2_COL, LOW);  analogWrite(PWM_COL, VELOCIDAD_COL); }
-void colReversa()  { digitalWrite(IN1_COL, LOW);  digitalWrite(IN2_COL, HIGH); analogWrite(PWM_COL, VELOCIDAD_COL); }
-void colOff()      { digitalWrite(IN1_COL, LOW);  digitalWrite(IN2_COL, LOW);  analogWrite(PWM_COL, 0); }
 
 // ---------------- DFPlayer ----------------
 void reproducirAudio(uint8_t track) {
@@ -480,9 +449,9 @@ void envTick(unsigned long now) {
 
 // ---------------- seguridad ----------------
 void safetyTick(unsigned long now) {
-  if (now - lastLinkMs > LINK_TIMEOUT_MS && (currentMotion != 'S' || currentCol != 'O')) {
-    detener(); colOff();
-    currentMotion = 'S'; currentCol = 'O';
+  if (now - lastLinkMs > LINK_TIMEOUT_MS && currentMotion != 'S') {
+    detener();
+    currentMotion = 'S';
     Serial.println(F("[SAFE] sin enlace NICLA -> STOP"));
   }
   if (radarActive && now - lastLinkMs > RADAR_LINK_TIMEOUT_MS) {
@@ -531,10 +500,9 @@ void sendTelemetry() {
   niclaSerial.print(distR);   niclaSerial.write(',');
   niclaSerial.print(dfPlayerOK ? 1 : 0); niclaSerial.write(',');
   niclaSerial.write(currentMotion); niclaSerial.write(',');
-  niclaSerial.write(currentCol);    niclaSerial.write(',');
-  niclaSerial.print(clamp16(rxBadBytes));         niclaSerial.write(',');
+  niclaSerial.print(clamp16(rxBadBytes));          niclaSerial.write(',');
   niclaSerial.print(clamp16(softwareRxOverflows)); niclaSerial.write(',');
-  niclaSerial.print(clamp16(rxLineOverflows));    niclaSerial.write(',');
+  niclaSerial.print(clamp16(rxLineOverflows));     niclaSerial.write(',');
   niclaSerial.print(tExt10);  niclaSerial.write(',');
   niclaSerial.print(rhExt);   niclaSerial.write(',');
   niclaSerial.print(tCab10);  niclaSerial.write(',');

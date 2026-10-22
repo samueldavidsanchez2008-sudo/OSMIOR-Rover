@@ -1,4 +1,4 @@
-# OSMIOR V4 - NICLA Vision / OpenMV 5.x
+# OSMIOR V5 - NICLA Vision / OpenMV 5.x
 # ============================================================
 # Arquitectura:
 #   HMI <-> WiFi/TCP <-> NICLA <-> UART4 <-> UNO
@@ -107,9 +107,9 @@ THEORETICAL_SPEED_MPS = THEORETICAL_RPM * math.pi * WHEEL_DIAMETER_M / 60.0
 ROLLING_RESISTANCE_COEFF = 0.03
 
 # Battery is an autonomy estimator, not a voltage/current measurement.
-FULL_RUNTIME_MIN = 90.0
-LOW_BATTERY_PCT = 20.0
-LOW_BATTERY_RESET_PCT = 25.0
+FULL_RUNTIME_MIN = 50.0
+LOW_BATTERY_PCT = 30.0  # referencia de telemetria; audio se gobierna por la mision de 50 min
+LOW_BATTERY_RESET_PCT = 35.0
 
 # Critical angle from centered-COM simplified equivalent support model.
 CRITICAL_ANGLE_DEG = math.degrees(math.atan2(HALF_LENGTH_M, COM_HEIGHT_M))
@@ -160,14 +160,12 @@ UART_BUSY_GUARD_MS = 2
 uart_busy_until_ms = 0
 last_uart_poll_ms = 0
 pending_motion = None          # (command, HMI sequence)
-pending_misc = []              # [(bytes, kind, code, seq), ...] collection / radar
+pending_misc = []              # [(bytes, kind, code, seq), ...] radar
 last_radar_poll_ms = 0
 radar_requested = False        # what the HMI asked for
 radar_sent_ms = 0
-collection_command = "O"       # what the HMI asked for (C / E / O)
-ack_retries = {"M": 0, "C": 0, "Z": 0}
+ack_retries = {"M": 0, "Z": 0}
 MAX_ACK_RETRIES = 3
-uno_col = "O"
 uno_radar = 0
 uno_t_ext = -99.9
 uno_hum = -1.0
@@ -202,6 +200,7 @@ orientation_initialized = False
 
 # Events / audio.
 last_audio = {
+    1: -100000,
     2: -100000,
     3: -100000,
     4: -100000,
@@ -213,7 +212,19 @@ PERSON_AUDIO_COOLDOWN_MS = 8000
 
 person_previous = False
 critical_audio_latched = False
-low_battery_latched = False
+# Mission clock is commanded explicitly by the HMI.
+MISSION_DURATION_MS = 50 * 60 * 1000
+MISSION_LOW_REMAINING_MS = 15 * 60 * 1000
+mission_active = False
+mission_start_ms = 0
+mission_low_audio_sent = False
+
+# IMU-only signed displacement estimate (no encoders: experimental, drift-prone).
+distance_imu_m = 0.0
+v_drive_mps = 0.0
+forward_acc_bias = 0.0
+last_distance_motion = "S"
+FORWARD_AXIS_SIGN = 1.0
 
 # ------------------------------------------------------------
 # HELPERS
@@ -466,6 +477,7 @@ def read_imu_update():
     global pitch_deg, roll_deg
     global v_imu_mps, a_forward_filtered
     global orientation_initialized, last_imu_ms
+    global distance_imu_m, v_drive_mps, forward_acc_bias, last_distance_motion
 
     now = now_ms()
 
@@ -501,38 +513,75 @@ def read_imu_update():
     last_imu_ms = now
     dt = min(0.2, max(0.001, dt))
 
-    # Gyro axes are board-dependent. These mappings are the usual
-    # body-frame interpretation for pitch/roll; flip signs above if needed.
+    # Complementary filter for pitch/roll.
     pitch_gyro = pitch_deg + (gy_dps * dt * PITCH_SIGN)
     roll_gyro = roll_deg + (gx_dps * dt * ROLL_SIGN)
-
     alpha = 0.98
     pitch_deg = alpha * pitch_gyro + (1.0 - alpha) * pitch_acc
     roll_deg = alpha * roll_gyro + (1.0 - alpha) * roll_acc
 
-    # IMU-only longitudinal speed estimate.
-    # Valid only as an estimate: no encoder and no external velocity reference.
+    # IMU odometry approximation. Only integrate while the commanded motion
+    # is FORWARD/BACKWARD and the mission is active. Turns and stops never add
+    # displacement. Gravity is approximated from pitch, then low-pass filtered,
+    # bias-corrected and dead-banded before integration.
     pitch_rad = math.radians(pitch_deg)
-    forward_acc_mps2 = (ax_g - math.sin(pitch_rad)) * GRAVITY
+    forward_acc_raw = (ax_g * FORWARD_AXIS_SIGN - math.sin(pitch_rad)) * GRAVITY
 
-    a_forward_filtered = (
-        0.85 * a_forward_filtered +
-        0.15 * forward_acc_mps2
-    )
-
-    if motion_command == "F":
-        v_imu_mps += a_forward_filtered * dt
-    elif motion_command == "B":
-        v_imu_mps -= a_forward_filtered * dt
-    else:
-        # Turns do not define a scalar forward velocity here.
-        v_imu_mps *= 0.85
-
-    # On an explicit stop we deliberately zero the user-facing estimate.
-    if motion_command == "S":
+    if not mission_active:
+        v_drive_mps = 0.0
         v_imu_mps = 0.0
+        a_forward_filtered = 0.0
+        if motion_command == "S":
+            forward_acc_bias = 0.98 * forward_acc_bias + 0.02 * forward_acc_raw
+        last_distance_motion = motion_command
+        return
 
-    v_imu_mps = max(-2.0, min(2.0, v_imu_mps))
+    if motion_command == "S":
+        # Stop is a zero-velocity update and an opportunity to learn the IMU bias.
+        forward_acc_bias = 0.98 * forward_acc_bias + 0.02 * forward_acc_raw
+        v_drive_mps = 0.0
+        v_imu_mps = 0.0
+        a_forward_filtered = 0.0
+        last_distance_motion = "S"
+        return
+
+    if motion_command in ("L", "R"):
+        # Differential turns rotate in place: they contribute no translation.
+        v_drive_mps = 0.0
+        v_imu_mps = 0.0
+        a_forward_filtered = 0.0
+        last_distance_motion = motion_command
+        return
+
+    if motion_command not in ("F", "B"):
+        v_drive_mps = 0.0
+        v_imu_mps = 0.0
+        a_forward_filtered = 0.0
+        last_distance_motion = motion_command
+        return
+
+    # When direction changes, do not carry velocity estimated in the old direction.
+    if motion_command != last_distance_motion:
+        v_drive_mps = 0.0
+        a_forward_filtered = 0.0
+    last_distance_motion = motion_command
+
+    a_forward_filtered = 0.75 * a_forward_filtered + 0.25 * forward_acc_raw
+    a_corrected = a_forward_filtered - forward_acc_bias
+    if abs(a_corrected) < 0.12:
+        a_corrected = 0.0
+
+    direction = 1.0 if motion_command == "F" else -1.0
+    # v_drive is speed in the direction of the active command (nonnegative).
+    v_drive_mps += a_corrected * direction * dt
+    if v_drive_mps < 0.0:
+        v_drive_mps = 0.0
+    # Gentle leakage reduces acceleration-integration drift but cannot replace
+    # wheel encoders; this is an indicative estimate, not measured odometry.
+    v_drive_mps *= 0.992
+    v_drive_mps = min(1.5, max(0.0, v_drive_mps))
+    distance_imu_m += direction * v_drive_mps * dt
+    v_imu_mps = direction * v_drive_mps
 
 
 def calculate_loads():
@@ -599,7 +648,7 @@ def update_drive_time(now):
     dt = elapsed(last_drive_update_ms, now)
     last_drive_update_ms = now
 
-    if motion_command != "S" and dt > 0:
+    if motion_command in ("F", "B") and dt > 0:
         drive_time_ms += dt
 
 
@@ -636,21 +685,12 @@ def enqueue_motion(cmd, seq=0):
 
 
 def enqueue_misc(payload, kind, code, seq=0):
-    """Collection (C/E/O) and radar (Z0/Z1) commands. Same kind -> last wins."""
+    """Radar commands are coalesced so the latest requested state wins."""
     for i in range(len(pending_misc) - 1, -1, -1):
         if pending_misc[i][1] == kind:
             pending_misc.pop(i)
     pending_misc.append((payload, kind, str(code), int(seq or 0)))
     return True
-
-
-def set_collection(cmd, seq=0):
-    global collection_command
-    cmd = str(cmd).upper()
-    if cmd not in ("C", "E", "O"):
-        return False
-    collection_command = cmd
-    return enqueue_misc(cmd.encode("ascii"), "C", cmd, seq)
 
 
 def set_radar(on, seq=0):
@@ -663,6 +703,46 @@ def set_radar(on, seq=0):
         # Audio 006 (inspeccion de la zona) suena al activar el radar.
         play_audio(6, 0, force=True)
     return enqueue_misc(b"Z1" if on else b"Z0", "Z", "1" if on else "0", seq)
+
+
+def start_mission():
+    global mission_active, mission_start_ms, mission_low_audio_sent
+    global distance_imu_m, v_drive_mps, v_imu_mps, a_forward_filtered, last_distance_motion
+    mission_active = True
+    mission_start_ms = now_ms()
+    mission_low_audio_sent = False
+    distance_imu_m = 0.0
+    v_drive_mps = 0.0
+    v_imu_mps = 0.0
+    a_forward_filtered = 0.0
+    last_distance_motion = "S"
+    play_audio(1, 0, force=True)
+    send_hmi("EVT;MISSION=START")
+    print("MISSION START; audio 1 queued")
+
+
+def stop_mission():
+    global mission_active, v_drive_mps, v_imu_mps, a_forward_filtered, last_distance_motion
+    mission_active = False
+    enqueue_motion("S", 0)
+    v_drive_mps = 0.0
+    v_imu_mps = 0.0
+    a_forward_filtered = 0.0
+    last_distance_motion = "S"
+    send_hmi("EVT;MISSION=STOP")
+    print("MISSION STOP")
+
+
+def update_mission_audio():
+    global mission_low_audio_sent
+    if not mission_active or mission_low_audio_sent:
+        return
+    elapsed_ms = elapsed(mission_start_ms)
+    if elapsed_ms >= MISSION_DURATION_MS - MISSION_LOW_REMAINING_MS:
+        play_audio(2, 0, force=True)
+        mission_low_audio_sent = True
+        send_hmi("EVT;MISSION=LOW_TIME;REMAIN_MIN=15")
+        print("MISSION: 15 min remain; audio 2 queued")
 
 
 def enqueue_audio(track, seq=0):
@@ -705,11 +785,8 @@ def play_audio(track, seq=0, force=False):
 def update_audio_events():
     global person_previous
     global critical_audio_latched
-    global low_battery_latched
 
     tilt_state, tilt = calculate_tilt_state()
-    battery_pct, _ = battery_estimate()
-
     if person_detected and not person_previous:
         play_audio(5)
     person_previous = person_detected
@@ -721,12 +798,6 @@ def update_audio_events():
     elif tilt < RED_ANGLE_DEG - 2.0:
         critical_audio_latched = False
 
-    if battery_pct <= LOW_BATTERY_PCT:
-        if not low_battery_latched:
-            play_audio(2)
-            low_battery_latched = True
-    elif battery_pct >= LOW_BATTERY_RESET_PCT:
-        low_battery_latched = False
 
 
 # ------------------------------------------------------------
@@ -736,7 +807,7 @@ def parse_uno_line(line):
     global uno_dl, uno_dr, uno_df_ok, uno_pwm
     global uno_state, last_uno_ack, uart_busy_until_ms
     global uno_rx_bad_bytes, uno_sw_overflows, uno_line_overflows
-    global uno_col, uno_radar, uno_t_ext, uno_hum, uno_t_cab, uno_press
+    global uno_radar, uno_t_ext, uno_hum, uno_t_cab, uno_press
     global radar_sent_ms, uno_envst, last_t_ms, last_env_print_ms
 
     line = line.strip()
@@ -746,26 +817,25 @@ def parse_uno_line(line):
     now = now_ms()
 
     if line.startswith("T,"):
-        # T,DL,DR,DF,MOV,COL,RXBAD,OVF,LINE,TEXT10,HUM,TCAB10,PRES10,RAD
+        # T,DL,DR,DF,MOV,RXBAD,OVF,LINE,TEXT10,HUM,TCAB10,PRES10,RAD,ENVST
         parts = line.split(",")
         if len(parts) >= 14:
             uno_dl = safe_float(parts[1], -1.0)
             uno_dr = safe_float(parts[2], -1.0)
             uno_df_ok = safe_int(parts[3], 0)
             uno_state = parts[4]
-            uno_col = parts[5]
-            uno_rx_bad_bytes = safe_int(parts[6], 0)
-            uno_sw_overflows = safe_int(parts[7], 0)
-            uno_line_overflows = safe_int(parts[8], 0)
-            te = safe_int(parts[9], -999)
+            uno_rx_bad_bytes = safe_int(parts[5], 0)
+            uno_sw_overflows = safe_int(parts[6], 0)
+            uno_line_overflows = safe_int(parts[7], 0)
+            te = safe_int(parts[8], -999)
             uno_t_ext = te / 10.0 if te > -900 else -99.9
-            uno_hum = safe_float(parts[10], -1.0)
-            tc = safe_int(parts[11], -999)
+            uno_hum = safe_float(parts[9], -1.0)
+            tc = safe_int(parts[10], -999)
             uno_t_cab = tc / 10.0 if tc > -900 else -99.9
-            pr = safe_int(parts[12], -1)
+            pr = safe_int(parts[11], -1)
             uno_press = pr / 10.0 if pr > 0 else -1.0
-            uno_radar = safe_int(parts[13], 0)
-            uno_envst = safe_int(parts[14], 0) if len(parts) >= 15 else 0
+            uno_radar = safe_int(parts[12], 0)
+            uno_envst = safe_int(parts[13], 0)
             last_t_ms = now
             if elapsed(last_env_print_ms, now) > 2000:
                 last_env_print_ms = now
@@ -864,8 +934,6 @@ def read_uno_uart():
 def _is_latest_intent(kind, code):
     if kind == "M":
         return code == motion_command
-    if kind == "C":
-        return code == collection_command
     if kind == "Z":
         return code == ("1" if radar_requested else "0")
     return False
@@ -873,7 +941,7 @@ def _is_latest_intent(kind, code):
 
 def expire_uart_acks(now):
     # A lost/corrupt byte must not leave the rover moving: if the ACK of the
-    # LATEST motion / collection / radar intent never arrives, resend it
+    # LATEST motion / radar intent never arrives, resend it
     # (bounded). Audio is not retried.
     global pending_motion
     for i in range(len(pending_uart_acks) - 1, -1, -1):
@@ -889,8 +957,6 @@ def expire_uart_acks(now):
                 if kind == "M":
                     if pending_motion is None:
                         pending_motion = (code, seq)
-                elif kind == "C":
-                    enqueue_misc(code.encode("ascii"), "C", code, seq)
                 else:
                     enqueue_misc(b"Z" + code.encode("ascii"), "Z", code, seq)
                 send_hmi("EVT;ACK_RETRY;TYPE={};CMD={};SEQ={}".format(kind, code, seq))
@@ -987,9 +1053,8 @@ def send_hmi(line):
 def close_client():
     global client, client_addr, hmi_rx_buffer
 
-    # Safety first: network loss -> stop rover, stop collection, radar off.
+    # Safety first: network loss -> stop rover and disable the optional radar.
     enqueue_motion("S", 0)
-    set_collection("O", 0)
     set_radar(False, 0)
 
     if client is not None:
@@ -1074,17 +1139,18 @@ def handle_hmi_line(line):
                 play_audio(track, seq)
         return
 
-    if upper.startswith("COL,"):
-        parts = upper.split(",")
-        if len(parts) >= 2 and parts[1]:
-            seq = safe_int(parts[2], 0) if len(parts) >= 3 else 0
-            set_collection(parts[1][0], seq)
-        return
-
     if upper.startswith("RAD,"):
         parts = upper.split(",")
         seq = safe_int(parts[2], 0) if len(parts) >= 3 else 0
         set_radar(len(parts) >= 2 and parts[1][:1] == "1", seq)
+        return
+
+    if upper == "MISSION,START":
+        start_mission()
+        return
+
+    if upper == "MISSION,STOP":
+        stop_mission()
         return
 
     if upper in ("F", "B", "L", "R", "S"):
@@ -1170,6 +1236,7 @@ def build_telemetry():
         "MODEL={};"
         "VTHEORY={:.3f};"
         "VIMU={:.3f};"
+        "DIST={:.3f};"
         "RPM={:.1f};"
         "VOUT={:.3f};"
         "TAUREQ={:.4f};"
@@ -1192,7 +1259,6 @@ def build_telemetry():
         "TCAB={:.1f};"
         "PRESS={:.1f};"
         "CO2=-1;"
-        "COL={};"
         "RADAR={};"
         "PRAW={};"
         "PIDX={};"
@@ -1213,9 +1279,10 @@ def build_telemetry():
         1 if person_detected else 0,
         person_score,
         1 if person_model_ok else 0,
-        THEORETICAL_SPEED_MPS if motion_command != "S" else 0.0,
+        THEORETICAL_SPEED_MPS if motion_command in ("F", "B") else 0.0,
         v_imu_mps,
-        THEORETICAL_RPM if motion_command != "S" else 0.0,
+        distance_imu_m,
+        THEORETICAL_RPM if motion_command in ("F", "B") else 0.0,
         VOLTAGE_EQUIVALENT,
         torque_motor,
         torque_total,
@@ -1233,7 +1300,6 @@ def build_telemetry():
         uno_hum,
         uno_t_cab,
         uno_press,
-        uno_col,
         uno_radar,
         person_raw,
         person_idx,
@@ -1282,7 +1348,7 @@ def init_system():
     last_hmi_rx_ms = now_ms()
 
     print("============================================")
-    print("OSMIOR NICLA V4 GATEWAY")
+    print("OSMIOR NICLA V5 GATEWAY")
     print("IP:", ap.ifconfig()[0])
     print("TCP:", TCP_PORT)
     print("UART4: SDA=TX / SCL=RX")
@@ -1292,9 +1358,8 @@ def init_system():
     print("V THEORY:", THEORETICAL_SPEED_MPS)
     print("============================================")
 
-    # Start UNO stopped, collection off, radar off.
+    # Start UNO stopped; radar is opt-in and remains disabled.
     enqueue_motion("S", 0)
-    set_collection("O", 0)
 
 
 # ------------------------------------------------------------
@@ -1324,6 +1389,7 @@ while True:
         update_person_hysteresis(raw_detected)
 
     update_audio_events()
+    update_mission_audio()
 
     if elapsed(last_telemetry_ms, now) >= TELEMETRY_PERIOD_MS:
         last_telemetry_ms = now

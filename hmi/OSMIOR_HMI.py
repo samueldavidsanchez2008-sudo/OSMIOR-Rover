@@ -68,7 +68,7 @@ class NetworkWorker(QThread):
         self.running = False
         try:
             if self.sock:
-                self.sock.sendall(b"CMD,S\n")
+                self.sock.sendall(b"CMD,S\nRAD,0\nMISSION,STOP\n")
         except Exception:
             pass
         try:
@@ -107,7 +107,7 @@ class NetworkWorker(QThread):
             try:
                 if key in {"PERSON", "MODEL", "DF", "PWM", "RADAR"}:
                     data[key] = int(float(value))
-                elif key in {"STATE", "COL", "PRAW", "MODE"}:
+                elif key in {"STATE", "PRAW", "MODE"}:
                     data[key] = value
                 else:
                     data[key] = float(value)
@@ -162,7 +162,7 @@ class NetworkWorker(QThread):
             upper = wire_line.upper()
 
             # Number commands at the HMI so each UNO ACK can be timed.
-            if upper.startswith(("CMD,", "AUD,", "COL,", "RAD,")):
+            if upper.startswith(("CMD,", "AUD,", "RAD,")):
                 fields = wire_line.split(",")
                 if len(fields) == 2:
                     self.sequence = (self.sequence + 1) % 1000000
@@ -295,9 +295,11 @@ class NetworkWorker(QThread):
 # ============================================================
 
 class AngleGauge(QWidget):
-    def __init__(self, title):
+    """Land-meter inspired gauge with a simplified rover silhouette."""
+    def __init__(self, title, view="side"):
         super().__init__()
         self.title = title
+        self.view = view  # side profile for pitch; front profile for roll
         self.value = 0.0
         self.critical = 35.0
         self.red = 30.0
@@ -314,50 +316,66 @@ class AngleGauge(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        cx, cy = w / 2.0, h * 0.48
+        r = min(w * 0.39, h * 0.39)
 
-        w = self.width()
-        h = self.height()
-        cx = w / 2.0
-        cy = h * 0.72
-        r = min(w * 0.38, h * 0.46)
-
-        p.setPen(QPen(QColor(GRAY), 10))
+        p.setPen(QPen(QColor(GRID), 10, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         p.drawArc(int(cx-r), int(cy-r), int(2*r), int(2*r), 210*16, -240*16)
+        for start_angle, span, color in ((210, -160, GREEN), (50, -40, YELLOW), (10, -40, RED)):
+            p.setPen(QPen(QColor(color), 8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawArc(int(cx-r), int(cy-r), int(2*r), int(2*r), start_angle*16, span*16)
 
-        # Central zero mark.
-        p.setPen(QPen(QColor(TEXT), 2))
         for deg in range(-45, 46, 15):
-            a = math.radians(-90 + deg * 240 / 90)
-            x1 = cx + math.cos(a) * (r - 2)
-            y1 = cy + math.sin(a) * (r - 2)
-            x2 = cx + math.cos(a) * (r - 18)
-            y2 = cy + math.sin(a) * (r - 18)
+            a = math.radians(-210 + (deg + 45) * (240.0 / 90.0))
+            x1, y1 = cx + math.cos(a) * (r - 3), cy + math.sin(a) * (r - 3)
+            x2, y2 = cx + math.cos(a) * (r - 15), cy + math.sin(a) * (r - 15)
+            p.setPen(QPen(QColor(TEXT if deg == 0 else GRAY), 2 if deg == 0 else 1))
             p.drawLine(int(x1), int(y1), int(x2), int(y2))
+            if deg in (-45, -30, 0, 30, 45):
+                tx, ty = cx + math.cos(a) * (r - 27), cy + math.sin(a) * (r - 27)
+                p.setPen(QColor(GRAY))
+                p.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
+                p.drawText(int(tx-13), int(ty-6), 26, 12, Qt.AlignmentFlag.AlignCenter, str(deg))
 
-        norm = (self.value-self.minimum)/(self.maximum-self.minimum)
-        needle_angle = math.radians(-120 + norm*240 - 90)
-        nx = cx + math.cos(needle_angle) * (r - 26)
-        ny = cy + math.sin(needle_angle) * (r - 26)
-
-        needle_color = GREEN
+        value_color = GREEN
         if abs(self.value) >= self.red:
-            needle_color = RED
+            value_color = RED
         elif abs(self.value) >= self.critical - 10:
-            needle_color = YELLOW
+            value_color = YELLOW
 
-        p.setPen(QPen(QColor(needle_color), 5))
-        p.drawLine(int(cx), int(cy), int(nx), int(ny))
-
-        p.setBrush(QColor(TEXT))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(int(cx-6), int(cy-6), 12, 12)
+        # Simple rover drawing rotates to make pitch/roll easier to read visually.
+        p.save()
+        p.translate(cx, cy + 1)
+        p.rotate(self.value if self.view == "side" else -self.value)
+        p.setPen(QPen(QColor(value_color), 2))
+        p.setBrush(QBrush(QColor(CARD)))
+        if self.view == "side":
+            body = [QPointF(-29, -6), QPointF(-21, -15), QPointF(13, -15),
+                    QPointF(25, -6), QPointF(25, 3), QPointF(-29, 3)]
+            p.drawPolygon(QPolygonF(body))
+            p.drawLine(-17, -15, -17, -21)
+            p.drawLine(-17, -21, -8, -21)
+            wheels = [(-21, 8), (-4, 8), (17, 8)]
+        else:
+            body = [QPointF(-15, -18), QPointF(15, -18), QPointF(19, 8), QPointF(-19, 8)]
+            p.drawPolygon(QPolygonF(body))
+            p.drawLine(-8, -18, -8, -24)
+            p.drawLine(-8, -24, 8, -24)
+            wheels = [(-23, -9), (23, -9), (-23, 7), (23, 7)]
+        p.setBrush(QBrush(QColor(value_color)))
+        for wx, wy in wheels:
+            radius = 5.0 if self.view == "side" else 4.0
+            p.drawEllipse(QPointF(wx, wy), radius, radius)
+        p.restore()
 
         p.setPen(QColor(TEXT))
         p.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
         p.drawText(0, 12, w, 24, Qt.AlignmentFlag.AlignCenter, self.title)
-
+        p.setPen(QColor(value_color))
         p.setFont(QFont("Consolas", 18, QFont.Weight.Bold))
-        p.drawText(0, int(cy+34), w, 28, Qt.AlignmentFlag.AlignCenter, f"{self.value:+.1f} deg")
+        p.drawText(0, int(cy + r + 10), w, 22, Qt.AlignmentFlag.AlignCenter,
+                   f"{self.value:+.1f} deg")
 
 
 # ============================================================
@@ -503,7 +521,7 @@ class HMI(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("OSMIOR // HMI")
+        self.setWindowTitle("OSMIOR // HMI V5")
         self.resize(1650, 1000)
         self.setMinimumSize(1400, 850)
 
@@ -515,7 +533,7 @@ class HMI(QMainWindow):
         self.worker.radar.connect(self.update_radar)
 
         self.hist = {key: [] for key in (
-            "VTHEORY", "VIMU",
+            "VTHEORY", "VIMU", "DIST",
             "TAUREQ", "TAUTOTAL",
             "PITCH", "ROLL", "CRIT", "TILT",
             "NFRONT", "NREAR", "NLEFT", "NRIGHT",
@@ -560,7 +578,7 @@ class HMI(QMainWindow):
         # Header.
         header = QHBoxLayout()
 
-        self.title = QLabel("OSMIOR // ROVER CONTROL TERMINAL V4")
+        self.title = QLabel("OSMIOR // ROVER CONTROL TERMINAL V5")
         self.title.setObjectName("title")
 
         self.conn_label = QLabel("DESCONECTADO")
@@ -593,16 +611,16 @@ class HMI(QMainWindow):
         self.build_control(main)
 
         # Bottom status / battery.
-        bottom = Card("AUTONOMIA ESTIMADA / EVENTOS")
+        bottom = Card("USO DE MISION / LIMITE 50 MIN")
         bottom_row = QHBoxLayout()
 
         self.battery_bar = QProgressBar()
         self.battery_bar.setRange(0, 100)
-        self.battery_bar.setValue(100)
+        self.battery_bar.setValue(0)
         self.battery_bar.setTextVisible(True)
-        self.battery_bar.setFormat("%p%")
+        self.battery_bar.setFormat("0.0 / 50 min usados")
 
-        self.battery_text = QLabel("100% / -- min")
+        self.battery_text = QLabel("50.0 min restantes")
         self.last_event_label = QLabel("EVENT: waiting")
         self.last_event_label.setObjectName("event")
 
@@ -617,8 +635,8 @@ class HMI(QMainWindow):
         card = Card("STABILITY / INCLINATION")
         gauges = QHBoxLayout()
 
-        self.pitch_gauge = AngleGauge("PITCH")
-        self.roll_gauge = AngleGauge("ROLL")
+        self.pitch_gauge = AngleGauge("PITCH", view="side")
+        self.roll_gauge = AngleGauge("ROLL", view="front")
         gauges.addWidget(self.pitch_gauge)
         gauges.addWidget(self.roll_gauge)
         card.layout.addLayout(gauges)
@@ -652,9 +670,9 @@ class HMI(QMainWindow):
         mission = Card("MISSION TIME")
         self.mission_clock = QLabel("T+ --:--:--")
         self.mission_clock.setObjectName("clock")
-        self.mission_info = QLabel("Esperando conexion al AP...")
+        self.mission_info = QLabel("Conecta el rover y pulsa INICIAR MISION.")
         self.mission_info.setObjectName("note")
-        self.mission_btn = QPushButton("FIN MISION")
+        self.mission_btn = QPushButton("INICIAR MISION")
         self.mission_btn.clicked.connect(self.toggle_mission)
         mission.layout.addWidget(self.mission_clock)
         mission.layout.addWidget(self.mission_info)
@@ -745,34 +763,16 @@ class HMI(QMainWindow):
 
         audio_row = QHBoxLayout()
         self.audio_combo = QComboBox()
-        self.audio_combo.addItems([
-            "1 - START",
-            "2 - LOW BATTERY",
-            "3 - PERSON QUERY",
-            "4 - CRITICAL TILT",
-            "5 - PERSON DETECTED",
-            "6 - INSPECCION ZONA",
-        ])
+        self.audio_combo.addItem("2 - LOW BATTERY", 2)
+        self.audio_combo.addItem("3 - PERSON QUERY", 3)
+        self.audio_combo.addItem("4 - CRITICAL TILT", 4)
+        self.audio_combo.addItem("5 - PERSON DETECTED", 5)
+        self.audio_combo.addItem("6 - INSPECCION ZONA", 6)
         audio_button = QPushButton("PLAY")
         audio_button.clicked.connect(self.play_selected_audio)
         audio_row.addWidget(self.audio_combo)
         audio_row.addWidget(audio_button)
         card.layout.addLayout(audio_row)
-
-        # ---- recoleccion ----
-        col_row = QHBoxLayout()
-        self.col_on = QPushButton("RECOLECTAR")
-        self.col_rev = QPushButton("REVERSA")
-        self.col_off = QPushButton("PARAR")
-        self.col_on.clicked.connect(lambda: self.worker.send_line("COL,C"))
-        self.col_rev.clicked.connect(lambda: self.worker.send_line("COL,E"))
-        self.col_off.clicked.connect(lambda: self.worker.send_line("COL,O"))
-        for b in (self.col_on, self.col_rev, self.col_off):
-            col_row.addWidget(b)
-        card.layout.addLayout(col_row)
-        self.col_label = QLabel("COLLECTOR: --")
-        self.col_label.setObjectName("telemetry")
-        card.layout.addWidget(self.col_label)
 
         # ---- radar ----
         self.radar_button = QPushButton("RADAR: OFF  (click para activar)")
@@ -789,6 +789,9 @@ class HMI(QMainWindow):
         self.imu_label = QLabel("PITCH: -- | ROLL: --")
         self.torque_label = QLabel("TAU/MOTOR: -- N*m | F: -- N")
         self.speed_label = QLabel("V THEORY: -- | V IMU: -- m/s")
+        self.displacement_label = QLabel("DESPLAZAMIENTO IMU (EST.): +0.00 m")
+        self.displacement_note = QLabel("Estimacion con deriva; sin encoders no es odometria precisa.")
+        self.displacement_note.setObjectName("note")
         self.df_label = QLabel("DFPLAYER: --")
         self.memory_label = QLabel("MEM: --")
 
@@ -801,11 +804,13 @@ class HMI(QMainWindow):
             self.imu_label,
             self.torque_label,
             self.speed_label,
+            self.displacement_label,
             self.df_label,
             self.memory_label,
         ):
             label.setObjectName("telemetry")
             card.layout.addWidget(label)
+        card.layout.addWidget(self.displacement_note)
 
         card.layout.addStretch()
         main.addWidget(card, 0, 2, 4, 1)
@@ -912,7 +917,7 @@ class HMI(QMainWindow):
         button.released.connect(lambda: self.worker.send_line("CMD,S"))
 
     def play_selected_audio(self):
-        track = self.audio_combo.currentIndex() + 1
+        track = int(self.audio_combo.currentData())
         self.worker.send_line(f"AUD,{track}")
 
     # --------------------------------------------------------
@@ -929,45 +934,78 @@ class HMI(QMainWindow):
         return "T+ {:02d}:{:02d}:{:02d}".format(seconds // 3600, (seconds // 60) % 60, seconds % 60)
 
     def mission_on_connect(self):
-        if self.mission_start is None and not self.mission_ended:
-            self.mission_start = time.monotonic()
-            self.mission_start_wall = datetime.datetime.now()
-            self.mission_btn.setText("FIN MISION")
+        # TCP connection alone must not start the mission or trigger audio.
         self.refresh_mission()
 
     def toggle_mission(self):
         if self.mission_start is not None and not self.mission_ended:
             self.mission_end = time.monotonic()
             self.mission_ended = True
+            self.worker.send_line("CMD,S")
+            self.worker.send_line("MISSION,STOP")
             self.mission_btn.setText("NUEVA MISION")
             total = self.mission_end - self.mission_start
             self.last_event_label.setText("EVENT: MISION TERMINADA " + self.fmt_clock(total))
         else:
-            self.mission_start = None
+            if not self.connected:
+                self.mission_info.setText("Sin conexion TCP. Conecta al rover antes de iniciar.")
+                return
+            self.mission_start = time.monotonic()
             self.mission_end = None
             self.mission_ended = False
-            self.mission_start_wall = None
+            self.mission_start_wall = datetime.datetime.now()
+            self.worker.send_line("MISSION,START")
             self.mission_btn.setText("FIN MISION")
-            if self.connected:
-                self.mission_on_connect()
+            self.last_event_label.setText("EVENT: MISION INICIADA; AUDIO 001")
         self.refresh_mission()
 
     def refresh_mission(self):
         if self.mission_start is None:
             self.mission_clock.setText("T+ --:--:--")
-            self.mission_info.setText("Esperando conexion al AP...")
+            self.mission_info.setText(
+                "Conectado. Pulse INICIAR MISION." if self.connected
+                else "Esperando conexion TCP; la conexion no inicia la mision."
+            )
             self.mission_clock.setStyleSheet(f"color:{GRAY};")
+            self.battery_bar.setValue(0)
+            self.battery_bar.setFormat("0.0 / 50 min usados")
+            self.battery_text.setText("50.0 min restantes")
+            self.battery_bar.setStyleSheet(
+                f"QProgressBar {{border:1px solid #24515a;background:#081214;text-align:center;color:{TEXT};}}"
+                f"QProgressBar::chunk {{background:{GREEN};}}"
+            )
+            self.mission_btn.setText("INICIAR MISION")
             return
+
         end = self.mission_end if self.mission_ended else time.monotonic()
-        self.mission_clock.setText(self.fmt_clock(end - self.mission_start))
+        elapsed_s = max(0.0, end - self.mission_start)
+        elapsed_min = elapsed_s / 60.0
+        remaining_min = max(0.0, 50.0 - elapsed_min)
+        self.mission_clock.setText(self.fmt_clock(elapsed_s))
         start_txt = self.mission_start_wall.strftime("%H:%M:%S")
+        used_pct = min(100, max(0, int(round(elapsed_s / 3000.0 * 100.0))))
+        self.battery_bar.setValue(used_pct)
+        self.battery_bar.setFormat(f"{min(50.0, elapsed_min):.1f} / 50 min usados")
+        self.battery_text.setText(f"{remaining_min:.1f} min restantes")
+        bar_color = RED if remaining_min <= 5.0 else (YELLOW if remaining_min <= 15.0 else GREEN)
+        self.battery_bar.setStyleSheet(
+            f"QProgressBar {{border:1px solid #24515a;background:#081214;text-align:center;color:{TEXT};}}"
+            f"QProgressBar::chunk {{background:{bar_color};}}"
+        )
+
         if self.mission_ended:
             self.mission_info.setText(f"Inicio {start_txt} | TERMINADA")
             self.mission_clock.setStyleSheet(f"color:{YELLOW};")
+            self.mission_btn.setText("NUEVA MISION")
         else:
-            link = "" if self.connected else " | SIN ENLACE (el tiempo sigue)"
-            self.mission_info.setText(f"Inicio {start_txt}{link}")
-            self.mission_clock.setStyleSheet(f"color:{GREEN};")
+            link = "" if self.connected else " | SIN ENLACE (contador local sigue)"
+            warning = " | AVISO DE TIEMPO: 15 MIN" if 0 < remaining_min <= 15 else ""
+            over = " | LIMITE DE 50 MIN SUPERADO" if elapsed_min >= 50 else ""
+            self.mission_info.setText(f"Inicio {start_txt} | Restan {remaining_min:.1f} min{warning}{over}{link}")
+            self.mission_clock.setStyleSheet(
+                f"color:{RED if remaining_min <= 5 else YELLOW if remaining_min <= 15 else GREEN};"
+            )
+            self.mission_btn.setText("FIN MISION")
 
     def toggle_radar(self):
         self.radar_wanted = not (self.radar_wanted or self.radar_actual)
@@ -1039,11 +1077,6 @@ class HMI(QMainWindow):
             rtt = fields.get("RTT_MS", "--")
             self.motion_label.setText(
                 "UNO CMD: {} | ACK RTT: {} ms".format(fields["CMD"], rtt)
-            )
-        elif fields.get("TYPE") == "C" and "CMD" in fields:
-            rtt = fields.get("RTT_MS", "--")
-            self.motion_label.setText(
-                "UNO COLLECT: {} | ACK RTT: {} ms".format(fields["CMD"], rtt)
             )
         elif fields.get("TYPE") == "Z" and "CMD" in fields:
             rtt = fields.get("RTT_MS", "--")
@@ -1138,10 +1171,6 @@ class HMI(QMainWindow):
                 data.get("PRAW", "--"), int(data.get("PIDX", -1)), luz_txt, int(data.get("VMS", 0)))
         )
 
-        col = str(data.get("COL", "O"))
-        self.col_label.setText(
-            "COLLECTOR: " + {"C": "ADELANTE", "E": "REVERSA", "O": "OFF"}.get(col, col))
-
         self.radar_actual = bool(data.get("RADAR", 0))
         if self.radar_actual:
             self.radar_wanted = True
@@ -1165,6 +1194,9 @@ class HMI(QMainWindow):
 
         self.speed_label.setText(
             f"V THEORY: {data.get('VTHEORY', 0):.3f} | V IMU: {data.get('VIMU', 0):+.3f} m/s"
+        )
+        self.displacement_label.setText(
+            f"DESPLAZAMIENTO IMU (EST.): {data.get('DIST', 0.0):+.2f} m"
         )
 
         self.df_label.setText(
@@ -1197,22 +1229,8 @@ class HMI(QMainWindow):
         set_curve("gyro", ["GX", "GY", "GZ"])
         set_curve("env", ["TEXT", "TCAB", "HUM"])
 
-        # ---------------- battery ----------------
-        battery = max(0, min(100, int(float(data.get("BAT", 0)))))
-        remain = float(data.get("REMAIN", 0.0))
-        self.battery_bar.setValue(battery)
-        self.battery_text.setText(f"{battery}% / {remain:.1f} min")
-
-        if battery <= 20:
-            self.battery_bar.setStyleSheet(
-                f"QProgressBar {{border:1px solid #24515a;background:#081214;text-align:center;color:{TEXT};}}"
-                f"QProgressBar::chunk {{background:{RED};}}"
-            )
-        else:
-            self.battery_bar.setStyleSheet(
-                f"QProgressBar {{border:1px solid #24515a;background:#081214;text-align:center;color:{TEXT};}}"
-                f"QProgressBar::chunk {{background:{GREEN};}}"
-            )
+        # Mission-use bar is based on the explicit 50-minute mission clock.
+        self.refresh_mission()
 
     # --------------------------------------------------------
     # KEYBOARD
@@ -1250,8 +1268,9 @@ class HMI(QMainWindow):
     def closeEvent(self, event):
         try:
             self.worker.send_line("CMD,S")
-            self.worker.send_line("COL,O")
             self.worker.send_line("RAD,0")
+            if self.mission_start is not None and not self.mission_ended:
+                self.worker.send_line("MISSION,STOP")
         except Exception:
             pass
         self.worker.stop()
