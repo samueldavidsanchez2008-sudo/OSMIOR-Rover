@@ -73,3 +73,17 @@ El filtrado reduce ruido, pero no elimina la deriva ni la limitación fundamenta
 ## Estado de validación
 
 Los archivos Python pasaron la comprobación de sintaxis. El pinout UNO fue corregido para respetar Driver 1 en D3-D5, Driver 2 en D6-D8 y STBY compartido en D9. Todavía no se hizo una prueba visual de la HMI. El sketch de Arduino requiere compilación en Arduino IDE con NewPing, DFRobotDFPlayerMini y Adafruit BMP280, seguida de pruebas físicas; no debe considerarse validado en hardware todavía.
+
+
+## Recuperación de emergencia — comparación V3/V5 (23-oct-2026)
+
+Se conservan los archivos V5 originales. Se contrastó el pinout de tracción contra `OSMIOR_UNO_V3.ino` de V3:
+
+- PWM izquierda D3, IN1/IN2 izquierda D4/D5.
+- PWM derecha D6, IN1/IN2 derecha D7/D8.
+- STBY compartido D9.
+- UART UNO D10 RX / D11 TX a 9600 baudios.
+
+**Resultado:** el pinout de motores ya coincide entre V3 y V5. Por tanto, no se cambió la lógica V5 por la V3 de forma indiscriminada: V3 usa ultrasonidos separados TRIG/ECHO en A0/A1 y A2/A3 y reproduce pista 001 al arrancar; V5 añade el radar, DHT11, BMP280 y la lógica de misión. Sustituir todo el UNO V5 por V3 eliminaría esas funciones y no sería una integración segura.
+
+**Verificación realizada:** los dos archivos Python pasaron `ast.parse` (sintaxis Python). El sketch `.ino` aún no se ha compilado con las librerías de Arduino y ningún archivo se ha probado físicamente en el rover. Flashea primero el UNO con ruedas elevadas y confirma UART/ACK antes de ejecutar el rover en el suelo.
