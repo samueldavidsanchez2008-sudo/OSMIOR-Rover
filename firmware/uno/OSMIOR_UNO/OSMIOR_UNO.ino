@@ -270,7 +270,7 @@ void detener() {
 void reproducirAudio(uint8_t track) {
   if (track < 1 || track > 6) return;
   if (!dfPlayerOK) { sendAck('A', '0'); return; }
-  dfPlayer.play(track);        // 10 bytes por SoftwareSerial TX (~10 ms)
+  dfPlayer.playMp3Folder(track); // reproduce /MP3/0001.mp3 ... /MP3/0006.mp3 por nombre numerico
   niclaSerial.listen();
   sendAck('A', (char)('0' + track));
 }
