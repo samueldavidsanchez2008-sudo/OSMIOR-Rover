@@ -27,6 +27,23 @@ HMI (PC, Python/PyQt6) ──WiFi / TCP :8080──► Nicla Vision (MicroPython
 
 Datos del artículo: unos 3.2 kg de masa y unos 40 × 30 × 30 cm. Más detalle en [`docs/paper/Rover_OSMIOR_IEEE.pdf`](docs/paper/Rover_OSMIOR_IEEE.pdf) y en el [esquemático](media/Images/esquematico_electronico.jpeg).
 
+## Mecánica y CAD
+
+El chasis y la suspensión rocker-bogie están hechos con tramos de tubo PVC cortados según los planos de [`cad/planos_pvc`](cad/planos_pvc). Las piezas de unión, los acoples de los motores, los ejes, la tapa y la pala se imprimieron en 3D.
+
+![Piezas impresas en 3D](media/Images/piezas_stl.png)
+
+| Pieza (STL) | Medidas aprox. | Uso |
+|---|---|---|
+| `Acople caja 1` / `Acople caja 2` | 30 × 60 mm | Acoples de la caja |
+| `Union entre motor FF` | 9 × 23 × 7 mm | Acople para el eje en doble D del motor TT |
+| `Ejess` / `Ejesss` | Ø5 × 60 mm / Ø5 × 15 mm | Ejes |
+| `Pieza1` | 60 × 10 × 5 mm | Eslabón con dos agujeros |
+| `Pala` | 102 × 77 × 130 mm | Pala del módulo de recolección (v4; se retiró en v5) |
+| `Tapa final` | 150 × 190 mm | Tapa de la caja |
+
+Los archivos fuente están en [`cad/Inventor`](cad/Inventor). Si cambias el nombre de un `.ipt`, se rompe la referencia en `Ensamblaje1.iam`.
+
 ## Estructura del repositorio
 
 ```
@@ -42,7 +59,11 @@ docs/
   expofisica/                       Anteproyecto y presentación mecánica
   latex/                            Fuentes LaTeX (guion de física, arquitectura de potencia)
   design_logs/                      DL-001 (mecánica) y DL-002 (potencia)
-cad/SolidWorks/                     Piezas CAD
+cad/
+  SolidWorks/                       Primeras piezas (rocker en PVC, brazo)
+  planos_pvc/                       Planos de los cortes de tubo PVC del rocker-bogie
+  Inventor/                         Fuentes .ipt de las piezas impresas y ensamblaje .iam
+  STL/                              Piezas listas para imprimir en 3D
 media/Images/                       Fotos, diagramas y capturas
 ```
 
