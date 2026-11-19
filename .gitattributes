@@ -7,3 +7,6 @@
 *.jpeg binary
 *.webp binary
 *.SLDPRT binary
+*.stl binary
+*.ipt binary
+*.iam binary
